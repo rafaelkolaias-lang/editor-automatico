@@ -176,3 +176,10 @@ O sistema aplica diversas otimizações para manter a velocidade na montagem:
 - **ffprobe paralelo:** dimensões de todos os arquivos são lidas simultaneamente com `ThreadPoolExecutor`
 - **Zoom deferido:** o zoom é acumulado e aplicado após a inserção de todos os clipes
 - **Cache de clipes O(1):** cada clipe inserido é capturado diretamente do retorno, sem reescanear a track
+
+---
+
+## Contribuintes 🚀
+
+Em construção por **Kolaias** e **Lucas** 🏗️
+
