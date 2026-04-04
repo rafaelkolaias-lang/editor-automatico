@@ -179,7 +179,17 @@ O sistema aplica diversas otimizações para manter a velocidade na montagem:
 
 ---
 
-## Contribuintes 🚀
+<div align="center">
 
-Em construção por **Kolaias** e **Lucas** 🏗️
+## 👨‍💻 Contribuintes
+
+<img src="https://readme-typing-svg.herokuapp.com?font=Fira+Code&weight=600&size=25&pause=1000&color=39FF14&center=true&vCenter=true&width=600&lines=Constru%C3%ADdo+por+Kolaias+e+Lucas+Erm%C3%A3os;Trabalhando+juntos+no+projeto!;Editor+Autom%C3%A1tico+Premium+🚀" alt="Typing SVG" />
+
+| **Kolaias** | **Lucas** |
+| :---: | :---: |
+| 🛠️ Arquiteto de Sistemas | 🎨 Desenvolvedor Fullstack |
+| [GitHub Profile](https://github.com/rafaelkolaias-lang) | [GitHub Profile](https://github.com/lucaslgomes549) |
+
+---
+</div>
 
