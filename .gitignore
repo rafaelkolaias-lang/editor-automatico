@@ -21,6 +21,11 @@ ffmpeg/
 # Claude
 .claude/
 
+# Credenciais e dados sensiveis (NIVEL 10 - NUNCA SUBIR)
+settings.json
+*.key
+credentials.*
+
 # Python
 __pycache__/
 *.pyc
