@@ -1,0 +1,28 @@
+# Arquivos grandes/binários
+*.rar
+*.mp4
+*.mp3
+*.wav
+*.aac
+*.mov
+*.avi
+
+# Pastas com mídia gerada
+cache/
+narracao/
+musica/
+partes/
+cenas/
+fontes/
+
+# FFmpeg binário
+ffmpeg/
+
+# Claude
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env

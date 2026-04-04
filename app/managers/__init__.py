@@ -1,0 +1,6 @@
+from .ConversionManager import ConversionManager
+from .DirectoriesManager import DirectoriesManager
+from .PremiereManager import PremiereManager
+from .SettingsManager import SettingsManager
+from .TranscriptionManager import TranscriptionManager
+from .TextOnScreenManager import TextOnScreenManager
