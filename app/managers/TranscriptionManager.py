@@ -72,7 +72,7 @@ class TranscriptionManager:
         transcriber = aai.Transcriber()
         transcription_config = aai.TranscriptionConfig(
           language_detection=True,
-          punctuate=False,
+          punctuate=True,
           speech_model=aai.SpeechModel.best
         )
 

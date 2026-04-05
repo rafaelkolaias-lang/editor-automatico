@@ -39,8 +39,8 @@ from ...managers.SettingsManager import SettingsManager
 _UI_CACHE_KEY = "renamer_ui"
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
-CARD_MIN_WIDTH = 280
-THUMB_W, THUMB_H = 220, 120
+CARD_MIN_WIDTH = 260
+THUMB_W, THUMB_H = 240, 135  # 16:9
 SEM_CENA_LABEL = "⚠ SEM CENA"
 
 
@@ -53,6 +53,34 @@ def _abrir_arquivo(path: Path):
     else:
         import subprocess
         subprocess.Popen(["xdg-open", str(path)])
+
+
+class _ToolTip:
+    """Tooltip simples que aparece ao passar o mouse sobre um widget."""
+    def __init__(self, widget, text: str):
+        self.widget = widget
+        self.text = text
+        self.tip_window = None
+        widget.bind("<Enter>", self._show)
+        widget.bind("<Leave>", self._hide)
+
+    def _show(self, event=None):
+        if self.tip_window:
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 5
+        self.tip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        lbl = tk.Label(tw, text=self.text, justify="left",
+                       bg="#ffffe0", fg="#333", relief="solid", borderwidth=1,
+                       font=("Arial", 9), padx=6, pady=4)
+        lbl.pack()
+
+    def _hide(self, event=None):
+        if self.tip_window:
+            self.tip_window.destroy()
+            self.tip_window = None
 
 
 def _listar_cenas(pasta: Path) -> tuple[dict, list]:
@@ -106,6 +134,12 @@ class RenamerFeedbackScreen:
         # fila de logs (thread-safe)
         self._log_queue: queue.Queue = queue.Queue()
 
+        # estado para reprocessamento e undo
+        self._last_script_items = None
+        self._last_scene_descs = None
+        self._last_manager = None
+        self._last_copied_files: list[str] = []
+
         # thread de stop
         self._stop_event = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
@@ -155,15 +189,47 @@ class RenamerFeedbackScreen:
         tk.Button(row_out, text="Escolher",
                   command=self._pick_output).pack(side="left")
 
-        # Opções
+        # Opções linha 1
         row_opts = tk.Frame(self._setup_frame)
-        row_opts.pack(fill="x", pady=6)
+        row_opts.pack(fill="x", pady=(6, 2))
         self._allow_pro_var = tk.IntVar(value=1)
         tk.Checkbutton(row_opts, text="Usar Gemini Pro como fallback",
                        variable=self._allow_pro_var).pack(side="left")
         self._include_audio_var = tk.IntVar(value=1)
         tk.Checkbutton(row_opts, text="Incluir áudio do vídeo na análise",
                        variable=self._include_audio_var).pack(side="left", padx=10)
+        self._allow_reuse_var = tk.IntVar(value=0)
+        tk.Checkbutton(row_opts, text="Permitir repetir cena",
+                       variable=self._allow_reuse_var).pack(side="left", padx=10)
+
+        # Opções linha 2: parâmetros numéricos com tooltips
+        row_opts2 = tk.Frame(self._setup_frame)
+        row_opts2.pack(fill="x", pady=(0, 4))
+
+        def _add_field_with_tip(parent, label_text, tip_text, var, from_, to_):
+            frm = tk.Frame(parent)
+            frm.pack(side="left", padx=(0, 10))
+            tk.Label(frm, text=label_text).pack(side="left")
+            spn = tk.Spinbox(frm, from_=from_, to=to_, width=3, textvariable=var)
+            spn.pack(side="left", padx=2)
+            tip_lbl = tk.Label(frm, text="(?)", fg="#0078D7", cursor="hand2", font=("Arial", 9, "bold"))
+            tip_lbl.pack(side="left")
+            _ToolTip(tip_lbl, tip_text)
+
+        self._n_words_var = tk.IntVar(value=6)
+        _add_field_with_tip(row_opts2, "Palavras no nome:",
+                            "Quantas palavras da frase serão usadas\npara nomear o arquivo copiado.\nEx: 6 = primeiras 6 palavras.",
+                            self._n_words_var, 2, 20)
+
+        self._sentences_per_chunk_var = tk.IntVar(value=1)
+        _add_field_with_tip(row_opts2, "Frases por item:",
+                            "Agrupa N frases do roteiro em 1 item\npara o casamento com cenas.\n1 = cada frase vira 1 item.\n2 = cada 2 frases viram 1 item.",
+                            self._sentences_per_chunk_var, 1, 5)
+
+        self._max_uses_var = tk.IntVar(value=1)
+        _add_field_with_tip(row_opts2, "Repetições:",
+                            "Quantas vezes a mesma cena pode ser\nusada em frases diferentes.\n1 = cada cena usada 1 vez.\n3 = mesma cena pode aparecer em até 3 frases.",
+                            self._max_uses_var, 1, 10)
 
         # Barra de progresso + log
         self._progress_var = tk.DoubleVar(value=0)
@@ -193,6 +259,16 @@ class RenamerFeedbackScreen:
                                        command=self._cancel_processing)
         self._btn_cancelar.pack(side="left", padx=4)
 
+        self._btn_reprocess = tk.Button(row_btns, text="Reprocessar Pendências",
+                                         bg="#D4A017", fg="white",
+                                         font=("Arial", 10, "bold"),
+                                         command=self._reprocess_pending)
+        self._btn_reprocess.pack(side="left", padx=4)
+
+        self._btn_undo = tk.Button(row_btns, text="Desfazer Última",
+                                    command=self._undo_last_run)
+        self._btn_undo.pack(side="left", padx=4)
+
         self._btn_revisar = tk.Button(row_btns, text="Ir para Revisão →",
                                       state="disabled", bg="#107C10", fg="white",
                                       font=("Arial", 11, "bold"),
@@ -217,6 +293,14 @@ class RenamerFeedbackScreen:
                 self._allow_pro_var.set(int(cfg["allow_pro"]))
             if "include_audio" in cfg:
                 self._include_audio_var.set(int(cfg["include_audio"]))
+            if "allow_reuse" in cfg:
+                self._allow_reuse_var.set(int(cfg["allow_reuse"]))
+            if "n_words" in cfg:
+                self._n_words_var.set(int(cfg["n_words"]))
+            if "sentences_per_chunk" in cfg:
+                self._sentences_per_chunk_var.set(int(cfg["sentences_per_chunk"]))
+            if "max_uses" in cfg:
+                self._max_uses_var.set(int(cfg["max_uses"]))
         except Exception:
             pass
 
@@ -229,6 +313,10 @@ class RenamerFeedbackScreen:
                 "output_dir": self._output_var.get(),
                 "allow_pro": self._allow_pro_var.get(),
                 "include_audio": self._include_audio_var.get(),
+                "allow_reuse": self._allow_reuse_var.get(),
+                "n_words": self._n_words_var.get(),
+                "sentences_per_chunk": self._sentences_per_chunk_var.get(),
+                "max_uses": self._max_uses_var.get(),
             }
             self.settings_manager.write_settings(settings)
         except Exception:
@@ -328,8 +416,9 @@ class RenamerFeedbackScreen:
             )
 
             # 1. Divide o roteiro em frases
-            script_items = build_script_items(roteiro_text)
-            self._log(f"Frases no roteiro: {len(script_items)}")
+            spc = max(1, self._sentences_per_chunk_var.get())
+            script_items = build_script_items(roteiro_text, sentences_per_chunk=spc)
+            self._log(f"Frases no roteiro: {len(script_items)} (frases/item={spc})")
 
             total_scenes = len(self._scene_names)
 
@@ -353,10 +442,12 @@ class RenamerFeedbackScreen:
                 raise ProcessingCancelled("Cancelado pelo usuário.")
 
             # 3. Matching semântico
-            self._log("Calculando casamento semântico...")
+            max_uses = max(1, self._max_uses_var.get()) if self._allow_reuse_var.get() else 1
+            self._log(f"Calculando casamento semântico (max_usos/cena={max_uses})...")
             assignments_result = manager.compute_assignments(
                 script_items=script_items,
                 scene_descs=scene_descs,
+                max_uses_per_scene=max_uses,
             )
             # compute_assignments devolve (List[Assignment], Set[int], Set[int])
             assignments_list = assignments_result[0] if isinstance(assignments_result, tuple) else assignments_result
@@ -377,8 +468,16 @@ class RenamerFeedbackScreen:
                 })
 
             self._progress_var.set(100)
-            self._log(f"Concluído! {sum(1 for a in self._assignments if a['assigned_scene'])} "
-                      f"de {len(self._assignments)} frases com cena atribuída.")
+            matched = sum(1 for a in self._assignments if a['assigned_scene'])
+            pending = len(self._assignments) - matched
+            self._log(f"Concluído! {matched} de {len(self._assignments)} frases com cena atribuída.")
+            if pending > 0:
+                self._log(f"[PENDENTE] {pending} frase(s) sem cena. Use 'Reprocessar Pendências' para tentar novamente.")
+
+            # Salvar estado para reprocessamento
+            self._last_script_items = script_items
+            self._last_scene_descs = scene_descs
+            self._last_manager = manager
 
             self.top.after(0, lambda: self._btn_revisar.config(state="normal"))
 
@@ -396,6 +495,96 @@ class RenamerFeedbackScreen:
         self._stop_event.set()
         self._log("Cancelando...")
 
+    def _reprocess_pending(self):
+        """Reprocessa apenas as frases que ficaram sem cena na última execução."""
+        if not hasattr(self, '_last_script_items') or not hasattr(self, '_last_scene_descs'):
+            messagebox.showwarning("Aviso", "Execute o processamento primeiro.", parent=self.top)
+            return
+        if not self._assignments:
+            messagebox.showwarning("Aviso", "Nenhum resultado anterior.", parent=self.top)
+            return
+
+        pending_idxs = [a["index"] for a in self._assignments if not a.get("assigned_scene")]
+        if not pending_idxs:
+            messagebox.showinfo("Info", "Nenhuma frase pendente.", parent=self.top)
+            return
+
+        self._log(f"\n{'='*50}")
+        self._log(f"[REPROCESS] Reprocessando {len(pending_idxs)} frases pendentes...")
+
+        max_uses = max(1, self._max_uses_var.get()) if self._allow_reuse_var.get() else 1
+
+        # Cenas já usadas — contar usos atuais
+        from ...utils.renamer_utils import Assignment as _Asn
+        scene_use_counts: dict = {}
+        for a in self._assignments:
+            if a.get("assigned_scene"):
+                sn = a["assigned_scene"]
+                si = self._scene_names.index(sn) if sn in self._scene_names else -1
+                if si >= 0:
+                    scene_use_counts[si] = scene_use_counts.get(si, 0) + 1
+
+        # Sub-roteiro e sub-cenas para reprocessar
+        pending_script = [self._last_script_items[i] for i in pending_idxs]
+
+        try:
+            self._log("Calculando casamento para pendentes...")
+            result = self._last_manager.compute_assignments(
+                script_items=pending_script,
+                scene_descs=self._last_scene_descs,
+                max_uses_per_scene=max(max_uses, 2),  # mais flexível no reprocess
+                initial_scene_use_counts=scene_use_counts,
+                min_assign_score=0.70,  # score mais baixo para pendentes
+            )
+            new_assignments = result[0] if isinstance(result, tuple) else result
+
+            resolved = 0
+            for new_a in new_assignments:
+                orig_idx = pending_idxs[new_a.phrase_idx]
+                scene_idx = new_a.scene_idx
+                if scene_idx < len(self._scene_names):
+                    self._assignments[orig_idx]["assigned_scene"] = self._scene_names[scene_idx]
+                    resolved += 1
+
+            still_pending = len(pending_idxs) - resolved
+            self._log(f"[REPROCESS] Resolvidas: {resolved} | Ainda pendentes: {still_pending}")
+
+            if hasattr(self, '_review_frame') and self._review_frame.winfo_ismapped():
+                self._populate_review_list()
+
+        except Exception as e:
+            self._log(f"[REPROCESS ERRO] {e}")
+
+    def _undo_last_run(self):
+        """Desfaz a última cópia de arquivos (remove arquivos copiados)."""
+        if not hasattr(self, '_last_copied_files') or not self._last_copied_files:
+            messagebox.showwarning("Aviso", "Nenhuma execução anterior para desfazer.", parent=self.top)
+            return
+
+        resp = messagebox.askyesno(
+            "Confirmar",
+            f"Remover {len(self._last_copied_files)} arquivo(s) copiados na última execução?",
+            parent=self.top)
+        if not resp:
+            return
+
+        removed = 0
+        erros = []
+        for path in self._last_copied_files:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    removed += 1
+            except Exception as e:
+                erros.append(f"{os.path.basename(path)}: {e}")
+
+        self._last_copied_files = []
+        msg = f"{removed} arquivo(s) removido(s)."
+        if erros:
+            msg += f"\nErros: {len(erros)}\n" + "\n".join(erros[:5])
+        self._log(f"[UNDO] {msg}")
+        messagebox.showinfo("Desfazer", msg, parent=self.top)
+
     # ------------------------------------------------------------------ #
     # FASE 2 – revisão (split-screen)
     # ------------------------------------------------------------------ #
@@ -404,8 +593,20 @@ class RenamerFeedbackScreen:
         # oculta a tela de setup
         self._setup_frame.pack_forget()
 
+        # Tela de carregamento
+        self._loading_frame = tk.Frame(self.top)
+        self._loading_frame.pack(fill="both", expand=True)
+        self._loading_label = tk.Label(self._loading_frame, text="Carregando revisão...",
+                                        font=("Arial", 14), fg="#555")
+        self._loading_label.pack(expand=True)
+        self.top.update_idletasks()
+
+        # Constrói a review escondida, só mostra quando tudo estiver pronto
+        self.top.after(50, self._build_review_phase)
+
+    def _build_review_phase(self):
+        # Cria o frame escondido (não faz pack ainda)
         self._review_frame = tk.Frame(self.top)
-        self._review_frame.pack(fill="both", expand=True)
 
         # PanedWindow horizontal
         pane = tk.PanedWindow(self._review_frame, orient="horizontal", sashrelief="raised")
@@ -495,9 +696,13 @@ class RenamerFeedbackScreen:
                   font=("Arial", 11, "bold"),
                   command=self._apply_copies).pack(side="right", padx=8)
 
-        # Popula os cards e a listbox
-        self._build_scene_items()
+        # Popula a listbox imediatamente (leve)
         self._rebuild_trechos_list()
+        # Cards são criados progressivamente para não travar
+        if self._scene_names:
+            self._build_scene_items_progressive(0)
+        else:
+            self._reveal_review()
 
     def _back_to_setup(self):
         if hasattr(self, "_review_frame"):
@@ -576,8 +781,17 @@ class RenamerFeedbackScreen:
 
     # -------- cards de cenas (direita) --------
 
-    def _build_scene_items(self):
-        for name in self._scene_names:
+    def _build_scene_items_progressive(self, start: int, batch: int = 10):
+        """Cria cards em lotes progressivos para não travar a UI."""
+        if start == 0:
+            self._pending_thumbs: list = []
+            self._building_cards = True
+
+        names = self._scene_names
+        end = min(start + batch, len(names))
+
+        for i in range(start, end):
+            name = names[i]
             if name in self.scene_cards:
                 continue
 
@@ -588,60 +802,91 @@ class RenamerFeedbackScreen:
             var = tk.IntVar(value=0)
             self.scene_vars[name] = var
 
-            # linha topo: checkbox + nome
             top_row = tk.Frame(card, bg="white")
             top_row.pack(fill="x")
             chk = tk.Checkbutton(top_row, variable=var, bg="white",
                                  command=lambda n=name: self._on_scene_click(n))
             chk.pack(side="left")
-            lbl_name = tk.Label(top_row, text=name, wraplength=210,
+            lbl_name = tk.Label(top_row, text=name, wraplength=280,
                                 justify="left", bg="white", font=("Arial", 9))
             lbl_name.pack(side="left", padx=2)
 
-            # thumbnail / video
+            # Placeholder com tamanho fixo em pixels (16:9)
+            thumb_frame = tk.Frame(card, width=THUMB_W, height=THUMB_H, bg="#e8e8e8")
+            thumb_frame.pack_propagate(False)
+            thumb_frame.pack(pady=4)
+            lbl_thumb = tk.Label(thumb_frame, text="carregando...", bg="#e8e8e8", fg="#999")
+            lbl_thumb.pack(fill="both", expand=True)
+            lbl_thumb._thumb_frame = thumb_frame  # referência para manter o tamanho
+
+            for w in (card, lbl_thumb, lbl_name, top_row):
+                w.bind("<Button-1>", lambda e, n=name: self._on_scene_click(n))
+
+            self._pending_thumbs.append((name, lbl_thumb))
+
+        if end < len(names):
+            self.top.after(5, lambda: self._build_scene_items_progressive(end, batch))
+        else:
+            # Todos os cards criados — agora faz o grid uma única vez e carrega thumbnails
+            self._building_cards = False
+            self._last_cols_count = None
+            self._rebuild_scene_grid()
+            self._load_thumbs_batch(0)
+
+    def _load_thumbs_batch(self, start: int, batch_size: int = 6):
+        """Carrega thumbnails em lotes de batch_size, cedendo controle à UI entre lotes."""
+        if not hasattr(self, '_pending_thumbs') or start >= len(self._pending_thumbs):
+            return
+
+        end = min(start + batch_size, len(self._pending_thumbs))
+        for i in range(start, end):
+            name, lbl_thumb = self._pending_thumbs[i]
             path = self._scene_paths.get(name)
             ext = path.suffix.lower() if path else ""
 
             if path and ext in IMAGE_EXTS and PIL_AVAILABLE:
                 thumb = self._get_img_thumbnail(name, path)
-                lbl_thumb = tk.Label(card, bg="#e8e8e8")
                 if thumb:
-                    lbl_thumb.configure(image=thumb)
+                    lbl_thumb.configure(image=thumb, text="")
                     lbl_thumb.image = thumb
                 else:
-                    lbl_thumb.configure(text="sem prévia", width=30, height=8)
-                lbl_thumb.pack(fill="both", expand=True, pady=4)
+                    lbl_thumb.configure(text="sem prévia")
 
             elif path and ext in VIDEO_EXTS and CV2_AVAILABLE and PIL_AVAILABLE:
                 thumb = self._get_vid_thumbnail(name, path)
                 bg_color = "#3a3a3a"
-                lbl_thumb = tk.Label(card, bg=bg_color)
+                lbl_thumb.configure(bg=bg_color)
                 if thumb:
-                    lbl_thumb.configure(image=thumb)
+                    lbl_thumb.configure(image=thumb, text="")
                     lbl_thumb.image = thumb
                 else:
                     lbl_thumb.configure(text="Passe o mouse\npara prévia",
-                                        width=30, height=8,
-                                        bg=bg_color, fg="white")
+                                        fg="white")
                 self.video_labels[name] = lbl_thumb
                 lbl_thumb.bind("<Enter>",
                                lambda e, n=name, p=path, l=lbl_thumb: self._on_video_enter(n, p, l))
                 lbl_thumb.bind("<Leave>", lambda e, n=name: self._on_video_leave(n))
-                lbl_thumb.pack(fill="both", expand=True, pady=4)
 
             else:
-                lbl_thumb = tk.Label(card, text="sem prévia",
-                                     width=30, height=8, bg="#ddd")
-                lbl_thumb.pack(fill="both", expand=True, pady=4)
+                lbl_thumb.configure(text="sem prévia", bg="#ddd")
 
-            # clique em qualquer parte do card seleciona a cena
-            for w in (card, lbl_thumb, lbl_name, top_row):
-                w.bind("<Button-1>", lambda e, n=name: self._on_scene_click(n))
+        if end < len(self._pending_thumbs):
+            self.top.after(10, lambda: self._load_thumbs_batch(end, batch_size))
+        else:
+            self._reveal_review()
 
-        self._rebuild_scene_grid()
+    def _reveal_review(self):
+        """Remove tela de carregamento e mostra a revisão completa."""
+        if hasattr(self, '_loading_frame') and self._loading_frame.winfo_exists():
+            self._loading_frame.destroy()
+            del self._loading_frame
+        if not self._review_frame.winfo_ismapped():
+            self._review_frame.pack(fill="both", expand=True)
 
     def _on_canvas_configure(self, event):
         self.canvas_cenas.itemconfig(self._scenes_window_id, width=event.width)
+        if getattr(self, '_building_cards', False):
+            return
         self._rebuild_scene_grid(event.width)
 
     def _rebuild_scene_grid(self, container_width: Optional[int] = None):
@@ -677,6 +922,17 @@ class RenamerFeedbackScreen:
         self._assignments[idx]["assigned_scene"] = scene_name
         self.lbl_cena_atual.config(text=f"Cena: {scene_name}", foreground="#107C10")
         self._rebuild_trechos_list()
+        self._select_next_without_scene()
+
+    def _select_next_without_scene(self):
+        """Seleciona automaticamente a próxima frase sem cena na listbox."""
+        for row, real_idx in enumerate(self.filtered_indices):
+            if not self._assignments[real_idx].get("assigned_scene"):
+                self.list_trechos.selection_clear(0, "end")
+                self.list_trechos.selection_set(row)
+                self.list_trechos.see(row)
+                self.list_trechos.event_generate("<<ListboxSelect>>")
+                return
 
     # -------- thumbnails --------
 
@@ -845,8 +1101,11 @@ class RenamerFeedbackScreen:
             if not resp:
                 return
 
+        n_words = max(2, self._n_words_var.get())
         erros = []
         copiados = 0
+        copied_files = []
+
         for item in self._assignments:
             scene_name = item.get("assigned_scene")
             if not scene_name:
@@ -856,20 +1115,26 @@ class RenamerFeedbackScreen:
                 erros.append(f"Arquivo não encontrado: {scene_name}")
                 continue
             phrase = (item.get("script_fragment") or "").strip()
-            # nome de destino: índice + trecho (sanitizado)
+            # nome de destino usando n_words
             import unicodedata, re as _re
-            safe = unicodedata.normalize("NFD", phrase)
+            words = [w.strip() for w in phrase.split() if w.strip()]
+            short = " ".join(words[:n_words])
+            safe = unicodedata.normalize("NFD", short)
             safe = "".join(c for c in safe if not unicodedata.combining(c))
             safe = safe.lower()
             safe = _re.sub(r"[^a-z0-9 ]", "", safe)
-            safe = _re.sub(r"\s+", " ", safe).strip()[:60]
-            dest_name = f"{item['index']:03d} {safe}{src_path.suffix}"
+            safe = _re.sub(r"\s+", " ", safe).strip()[:80]
+            dest_name = f"{safe}{src_path.suffix}"
             dest_path = Path(output_dir) / dest_name
             try:
                 shutil.copy2(str(src_path), str(dest_path))
                 copiados += 1
+                copied_files.append(str(dest_path))
             except Exception as e:
                 erros.append(f"{scene_name}: {e}")
+
+        # Salvar para undo
+        self._last_copied_files = copied_files
 
         msg = f"{copiados} arquivo(s) copiado(s) para:\n{output_dir}"
         if erros:
@@ -881,7 +1146,10 @@ class RenamerFeedbackScreen:
     # ------------------------------------------------------------------ #
 
     def _log(self, msg: str):
-        self._log_queue.put(msg)
+        import threading
+        thread = threading.current_thread()
+        prefix = f"[{thread.name}]"
+        self._log_queue.put(f"{prefix} {msg}")
 
     def _poll_log_queue(self):
         try:

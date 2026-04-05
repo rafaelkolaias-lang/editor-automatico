@@ -1,6 +1,7 @@
 import os
 import time
 import random
+from concurrent.futures import ThreadPoolExecutor, Future
 import pymiere
 import pymiere.wrappers
 from typing import Optional, Dict, Any, Callable
@@ -102,10 +103,17 @@ def ensure_sequence(self, script_name: str):
 
     pymiere.objects.qe.project.newSequence(script_name, preset_path)
 
-    new_seq = [
+    matches = [
         seq for seq in pymiere.objects.app.project.sequences
         if seq.name == script_name
-    ][0]
+    ]
+    if not matches:
+        raise RuntimeError(
+            f'Sequência "{script_name}" não foi criada pelo Premiere. '
+            f'Verifique se o Premiere está aberto e com um projeto ativo. '
+            f'Preset usado: "{preset_path}"'
+        )
+    new_seq = matches[0]
 
     _apply_sequence_frame_size(new_seq, self.FRAME_W, self.FRAME_H)
 
@@ -134,10 +142,23 @@ def mount_sequence(
     fill_gaps_with_random_scenes: bool = False,
     max_fill_scene_duration: float = 0.0,
 
-    # NOVO
     narrations_transcriptions: Optional[list[Any]] = None,
     impact_phrases_config: Optional[dict] = None,
-    openai_api_key: str = ''
+    openai_api_key: str = '',
+
+    # Recursos visuais
+    logo_path: str = '',
+    logo_position: str = 'bottom_right',
+    overlay_path: str = '',
+    cta_enabled: bool = False,
+    cta_anim_path: str = '',
+    cta_chroma_key: bool = True,
+
+    # Mixer (dB)
+    vol_scene_db: float = 0.0,
+    vol_narration_db: float = 0.0,
+    vol_cta_db: float = -9.0,
+    vol_music_db: float = -12.0,
 ) -> Result[None]:
 
     project_item_cache = {}
@@ -188,10 +209,24 @@ def mount_sequence(
 
     sorted_narrations_files = sorted(narrations_files)
 
-    # NOVO: garanta logo no início que existe a trilha onde o texto vai entrar (índice 3 = V4)
-    # Isso evita "subir trilhas" no final e evita falha por falta de track.
+    # Garante que TODAS as trilhas necessarias existam ANTES de inserir conteudo.
+    # addTracks insere no topo e empurra conteudo existente, entao criamos
+    # todas de uma vez antes de qualquer clip para evitar deslocamento.
+    _max_video_idx = max(
+        mgr.SCENE_TRACK_INDEX, mgr.CTA_TRACK_INDEX,
+        mgr.IMPACT_TEXT_TRACK_INDEX, mgr.OVERLAY_TRACK_INDEX,
+        mgr.LOGO_TRACK_INDEX
+    )
+    _max_audio_idx = max(
+        mgr.SCENE_TRACK_INDEX, mgr.NARRATION_TRACK_INDEX,
+        mgr.CTA_AUDIO_TRACK_INDEX, mgr.MUSIC_TRACK_INDEX
+    )
     try:
-        mgr._PremiereManager__ensure_video_track_index(3)
+        mgr._PremiereManager__ensure_video_track_index(_max_video_idx)
+    except Exception:
+        pass
+    try:
+        mgr._PremiereManager__ensure_audio_track_index(_max_audio_idx)
     except Exception:
         pass
 
@@ -207,10 +242,106 @@ def mount_sequence(
             _prefetch_paths.append(_resolve_path(os.path.join(scenes_base_path, _part.text)))
     for _mf in musics_files:
         _prefetch_paths.append(_resolve_path(os.path.join(musics_base_path, _mf)))
+    # Inclui overlay, logo e CTA no prefetch para evitar importação duplicada
+    for _vp in [overlay_path, logo_path, cta_anim_path]:
+        if _vp and os.path.exists(_vp):
+            _prefetch_paths.append(_resolve_path(_vp))
     _prefetch_paths = list(dict.fromkeys(p for p in _prefetch_paths if p))
     print(f"[prefetch] pré-processando {len(_prefetch_paths)} arquivos...")
     mgr._PremiereManager__prefetch_all_media(_prefetch_paths, project_item_cache, dims_cache)
     print("[prefetch] concluído — caches prontos.")
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Fase 1b: Pré-calcular offsets das narrações (para frases impactantes) ──
+    _precalc_offsets: dict[str, float] = {}
+    _offset_acc = 0.0
+    for _nf in sorted_narrations_files:
+        _precalc_offsets[_nf] = _offset_acc
+        _narr_path = _resolve_path(os.path.join(narration_base_path, _nf))
+        _narr_dur = mgr._PremiereManager__get_video_duration_s(_narr_path)
+        if _narr_dur > 0:
+            _offset_acc += _narr_dur
+        else:
+            _offset_acc += 30.0  # fallback seguro
+    print(f"[impact] offsets pré-calculados: {len(_precalc_offsets)} narrações, total={_offset_acc:.1f}s")
+
+    # ── Fase 1c: Renderização FFmpeg paralela (overlay + logo + frases) ──────
+    # Dispara threads para pré-renderizar overlay (10 min loop) e logo (10 min
+    # posicionado) via FFmpeg ENQUANTO as cenas são inseridas na timeline.
+    # Se o arquivo já foi renderizado anteriormente, retorna do cache instantaneamente.
+    _ffmpeg_overlay_future: Future | None = None
+    _ffmpeg_logo_future: Future | None = None
+    _ffmpeg_pool: ThreadPoolExecutor | None = None
+
+    if (overlay_path and os.path.exists(overlay_path)) or \
+       (logo_path and os.path.exists(logo_path)):
+        _ffmpeg_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='ffmpeg')
+
+        if overlay_path and os.path.exists(overlay_path):
+            _ffmpeg_overlay_future = _ffmpeg_pool.submit(
+                mgr._PremiereManager__extend_video_ffmpeg,
+                overlay_path, 600.0
+            )
+            print("[ffmpeg-thread] overlay: verificando cache/renderizando em paralelo...")
+
+        if logo_path and os.path.exists(logo_path):
+            _ffmpeg_logo_future = _ffmpeg_pool.submit(
+                mgr._PremiereManager__render_logo_positioned_mp4,
+                logo_path, logo_position, 600.0
+            )
+            print("[ffmpeg-thread] logo: verificando cache/renderizando em paralelo...")
+
+        # Não faz shutdown(wait=True) aqui — as threads rodam em paralelo com
+        # a montagem das cenas. O join acontece antes da inserção na timeline.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Fase 1d: Frases impactantes em paralelo (usando offsets pré-calculados) ──
+    _impact_future: Future | None = None
+    _impact_tos = None
+    _impact_pool: ThreadPoolExecutor | None = None
+
+    try:
+        cfg = impact_phrases_config or {}
+        if isinstance(cfg, dict) and cfg.get("enabled"):
+            t_list = []
+            off_list = []
+            for nf in sorted_narrations_files:
+                t = transcriptions_by_file.get(nf)
+                off = _precalc_offsets.get(nf, None)
+                if t is None or off is None:
+                    continue
+                t_list.append(t)
+                off_list.append(float(off))
+
+            if t_list:
+                dims = Dimensions(mgr.FRAME_W, mgr.FRAME_H)
+                script_name = os.path.basename(os.path.normpath(narration_base_path))
+                out_dir = os.path.join(mgr.CWD, "projeto", script_name, "impact_text")
+                os.makedirs(out_dir, exist_ok=True)
+
+                _impact_tos = TextOnScreenManager(openai_api_key=openai_api_key)
+                _impact_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='impact')
+                _impact_future = _impact_pool.submit(
+                    _impact_tos.build_text_overlays,
+                    transcriptions=t_list,
+                    offsets_seconds=off_list,
+                    dims=dims,
+                    output_dir=out_dir,
+                    mode=str(cfg.get("mode", "phrase")),
+                    max_phrases_total=int(cfg.get("max_phrases_total", 5)),
+                    min_gap_seconds=float(cfg.get("min_gap_seconds", 8.0)),
+                    fps="60000/1001",
+                    language="pt-BR",
+                    position=str(cfg.get("position", "bottom")),
+                    font_name=str(cfg.get("font_name", "")),
+                    font_file=str(cfg.get("font_file", "")),
+                    font_size_px=cfg.get("font_size_px", None),
+                    text_style=cfg.get("text_style", None),
+                    use_cache=bool(cfg.get("use_cache", False)),
+                )
+                print("[impact] seleção + renderização iniciada em paralelo (offsets pré-calculados).")
+    except Exception as e:
+        print(f"[impact] excepcao ao iniciar: {e}")
     # ─────────────────────────────────────────────────────────────────────────
 
     with mgr.fast_ops():
@@ -303,7 +434,8 @@ def mount_sequence(
                         raise Exception(
                             f'Scene clip with path "{media_path}" has no end')
 
-                    # Limita duração máxima com margem ±1s para variação natural
+                    # Limita duracao maxima: SEMPRE corta fisicamente quando excede max_dur
+                    # (a otimizacao de "nao cortar" so se aplica entre cenas, nao aqui)
                     if max_dur > 0:
                         clip_dur = current_scene_clip.end.seconds - current_scene_clip.start.seconds
                         actual_max = max_dur + random.uniform(-1.0, 1.0)
@@ -311,19 +443,26 @@ def mount_sequence(
                         if clip_dur > actual_max:
                             cut_at = current_scene_clip.start.seconds + actual_max
                             tc = pymiere.wrappers.timecode_from_seconds(
-                                cut_at, pymiere.objects.app.project.activeSequence
-                            )
+                                cut_at, pymiere.objects.app.project.activeSequence)
                             mgr._PremiereManager__qe_razor_with_retry(
-                                track_type='video',
-                                track_index=mgr.SCENE_TRACK_INDEX,
-                                timecode=tc
-                            )
+                                track_type='video', track_index=mgr.SCENE_TRACK_INDEX, timecode=tc)
+                            mgr._PremiereManager__qe_razor_with_retry(
+                                track_type='audio', track_index=mgr.SCENE_TRACK_INDEX, timecode=tc)
                             vt = pymiere.objects.app.project.activeSequence.videoTracks[
                                 mgr.SCENE_TRACK_INDEX]
                             n_razor = len(vt.clips)
                             if n_razor > 0:
                                 vt.clips[n_razor - 1].remove(False, False)
-                            # Atualiza referência para o clipe truncado
+                            try:
+                                at = pymiere.objects.app.project.activeSequence.audioTracks[
+                                    mgr.SCENE_TRACK_INDEX]
+                                a_clips = list(at.clips)
+                                if a_clips:
+                                    last_a = a_clips[-1]
+                                    if abs(last_a.start.seconds - cut_at) < 0.15:
+                                        last_a.remove(False, False)
+                            except Exception:
+                                pass
                             n_trim = len(vt.clips)
                             if n_trim > 0:
                                 current_scene_clip = vt.clips[n_trim - 1]
@@ -335,20 +474,25 @@ def mount_sequence(
                     inserted_scene_clips.append(current_scene_clip)
                     current_scene_end = current_scene_clip.end
 
+                # Duracao maxima para cenas principais (15-20s aleatorio)
+                MAX_MAIN_SCENE_SEC = random.uniform(15.0, 20.0)
+
                 if duplicate_scenes_until_next:
                     while current_scene_end.seconds < next_scene_start.seconds:
                         prev_end = current_scene_end.seconds
                         _insert_scene_clip(
-                            imported_scene, scene_path, current_scene_end)
+                            imported_scene, scene_path, current_scene_end,
+                            max_dur=MAX_MAIN_SCENE_SEC)
 
-                        # trava anti-loop (se o Premiere não avançar o tempo)
+                        # trava anti-loop (se o Premiere nao avancar o tempo)
                         if current_scene_end.seconds <= prev_end + 1e-6:
                             break
 
                 else:
-                    # Insere apenas 1 clipe (não repete até a próxima cena)
+                    # Insere apenas 1 clipe (limita a 15-20s)
                     _insert_scene_clip(
-                        imported_scene, scene_path, current_scene_end)
+                        imported_scene, scene_path, current_scene_end,
+                        max_dur=MAX_MAIN_SCENE_SEC)
 
                     # NOVO: se habilitado, preenche o "buraco" com cenas aleatórias
                     if fill_gaps_with_random_scenes:
@@ -357,7 +501,7 @@ def mount_sequence(
                         safety = 0
                         while current_scene_end.seconds < next_scene_start.seconds - 1e-6 and safety < 50:
                             # Não adiciona um clipe se o espaço restante for muito curto.
-                            # Isso evita criar clipes “picotados” (ex.: 2s) quando sobra pouco tempo até a próxima cena.
+                            # Isso evita criar clipes "picotados" (ex.: 2s) quando sobra pouco tempo até a próxima cena.
                             remaining_gap = next_scene_start.seconds - current_scene_end.seconds
                             if remaining_gap < 3.0:
                                 break
@@ -393,15 +537,12 @@ def mount_sequence(
                             if current_scene_end.seconds <= prev_end + 1e-6:
                                 break
 
-                            # --- REGRA 1: não aceita clipe menor que o mínimo (3s) ---
-                            vtrack_tmp = pymiere.objects.app.project.activeSequence.videoTracks[
-                                mgr.SCENE_TRACK_INDEX]
-                            clips_tmp = list(vtrack_tmp.clips)
-                            last_clip_tmp = clips_tmp[-1] if clips_tmp else None
+                            # --- REGRA 1: nao aceita clipe menor que o minimo (3s) ---
+                            # Usa inserted_scene_clips ao inves de list(track.clips) para evitar IPC O(N)
+                            last_clip_tmp = inserted_scene_clips[-1] if inserted_scene_clips else None
                             if last_clip_tmp is not None:
                                 last_len_tmp = last_clip_tmp.end.seconds - last_clip_tmp.start.seconds
                                 if last_len_tmp + 1e-6 < MIN_FILL_SEC:
-                                    # remove o clipe curto e tenta outro (linkAction=False: só vídeo)
                                     last_clip_tmp.remove(False, False)
                                     scenes_repetition_count = prev_rep
                                     del inserted_scene_dims[prev_dims_len:]
@@ -410,22 +551,15 @@ def mount_sequence(
                                         prev_end)
                                     continue
 
-                            # --- REGRA 2: evita sobrar “restinho” preto (< 3s) ---
+                            # --- REGRA 2: evita sobrar "restinho" preto (< 3s) ---
                             remaining_after = next_scene_start.seconds - current_scene_end.seconds
                             if 0 < remaining_after < MIN_FILL_SEC - 1e-6:
-                                # Precisamos ajustar o clipe recém-inserido para sobrar exatamente 3s
-                                # quanto precisamos “devolver” para o final
                                 delta = MIN_FILL_SEC - remaining_after
-
-                                vtrack_tmp = pymiere.objects.app.project.activeSequence.videoTracks[
-                                    mgr.SCENE_TRACK_INDEX]
-                                clips_tmp = list(vtrack_tmp.clips)
-                                last_clip_tmp = clips_tmp[-1] if clips_tmp else None
+                                last_clip_tmp = inserted_scene_clips[-1] if inserted_scene_clips else None
 
                                 if last_clip_tmp is not None:
                                     last_len_tmp = last_clip_tmp.end.seconds - last_clip_tmp.start.seconds
 
-                                    # Só podemos cortar se, depois de cortar, o clipe ainda tiver pelo menos 3s
                                     if (last_len_tmp - delta) >= MIN_FILL_SEC - 1e-6:
                                         new_end_sec = last_clip_tmp.end.seconds - delta
                                         tc = pymiere.wrappers.timecode_from_seconds(
@@ -437,24 +571,20 @@ def mount_sequence(
                                             timecode=tc
                                         )
 
-                                        # remove a parte da direita (sem ripple, linkAction=False: só vídeo)
+                                        # remove a parte da direita e atualiza referencia (1 leitura unica)
                                         vtrack_tmp = pymiere.objects.app.project.activeSequence.videoTracks[
                                             mgr.SCENE_TRACK_INDEX]
-                                        clips_tmp = list(vtrack_tmp.clips)
-                                        if clips_tmp:
-                                            clips_tmp[-1].remove(False, False)
-
-                                        # atualiza current_scene_end (agora o “resto” virou 3s)
-                                        vtrack_tmp = pymiere.objects.app.project.activeSequence.videoTracks[
-                                            mgr.SCENE_TRACK_INDEX]
-                                        clips_tmp = list(vtrack_tmp.clips)
-                                        if clips_tmp:
-                                            current_scene_end = clips_tmp[-1].end
+                                        n_tmp = len(vtrack_tmp.clips)
+                                        if n_tmp > 0:
+                                            vtrack_tmp.clips[n_tmp - 1].remove(False, False)
+                                        # atualiza referencia do clip que ficou
+                                        n_after = len(vtrack_tmp.clips)
+                                        if n_after > 0:
+                                            kept = vtrack_tmp.clips[n_after - 1]
+                                            current_scene_end = kept.end
                                             if inserted_scene_clips:
-                                                inserted_scene_clips[-1] = clips_tmp[-1]
+                                                inserted_scene_clips[-1] = kept
                                     else:
-                                        # Esse clipe não dá para ajustar sem ficar menor que 3s.
-                                        # Remove e tenta outro arquivo (para evitar ficar preto no final).
                                         last_clip_tmp.remove(False, False)
                                         scenes_repetition_count = prev_rep
                                         del inserted_scene_dims[prev_dims_len:]
@@ -463,53 +593,60 @@ def mount_sequence(
                                             prev_end)
                                         continue
 
-                # Cut remaining scene
+                # Corte de cena excedente
+                # Modo rapido (duplicar/gaps habilitado):
+                #   VIDEO: nao corta - a proxima cena sobrescreve automaticamente (overwriteClip)
+                #          so corta na ultima cena para alinhar com fim da narracao
+                #   AUDIO: corta apenas se a cena TEM audio (overwrite nao afeta trilha de audio)
+                # Modo normal (ambos desabilitados):
+                #   Corta tudo (video + audio) como antes
+                _modo_rapido = duplicate_scenes_until_next or fill_gaps_with_random_scenes
+                is_last_part = (part_index + 1 >= len(narration_transcription_parts))
+
                 if current_scene_end.seconds > next_scene_start.seconds:
                     timecode_to_cut = pymiere.wrappers.timecode_from_time(
                         next_scene_start,
                         pymiere.objects.app.project.activeSequence
                     )
 
-                    mgr._PremiereManager__qe_razor_with_retry(
-                        track_type='video', track_index=mgr.SCENE_TRACK_INDEX, timecode=timecode_to_cut)
-                    mgr._PremiereManager__qe_razor_with_retry(
-                        track_type='audio', track_index=mgr.SCENE_TRACK_INDEX, timecode=timecode_to_cut)
+                    # VIDEO: corta se modo normal OU se for a ultima cena
+                    if not _modo_rapido or is_last_part:
+                        mgr._PremiereManager__qe_razor_with_retry(
+                            track_type='video', track_index=mgr.SCENE_TRACK_INDEX, timecode=timecode_to_cut)
 
-                    video_clips = pymiere.objects.app.project.activeSequence.videoTracks[
-                        mgr.SCENE_TRACK_INDEX].clips
+                        video_clips = pymiere.objects.app.project.activeSequence.videoTracks[
+                            mgr.SCENE_TRACK_INDEX].clips
+                        if len(video_clips) > 0:
+                            video_clips[-1].remove(False, False)
 
-                    # linkAction=False: remove apenas o clipe de vídeo sem tocar no
-                    # áudio linkado. Se usarmos linkAction=True aqui, o Premiere remove
-                    # o áudio junto via link e a leitura de audio_clips[-1] abaixo
-                    # aponta para o clipe anterior, deletando áudio de cenas passadas.
-                    if len(video_clips) > 0:
-                        video_clips[-1].remove(False, False)
+                        if inserted_scene_clips:
+                            try:
+                                vt_post = pymiere.objects.app.project.activeSequence.videoTracks[
+                                    mgr.SCENE_TRACK_INDEX]
+                                n_post = len(vt_post.clips)
+                                if n_post > 0:
+                                    inserted_scene_clips[-1] = vt_post.clips[n_post - 1]
+                            except Exception:
+                                pass
 
-                    # Atualiza referência do último clipe inserido (razor trocou o objeto)
-                    if inserted_scene_clips:
-                        try:
-                            vt_post = pymiere.objects.app.project.activeSequence.videoTracks[
-                                mgr.SCENE_TRACK_INDEX]
-                            n_post = len(vt_post.clips)
-                            if n_post > 0:
-                                inserted_scene_clips[-1] = vt_post.clips[n_post - 1]
-                        except Exception:
-                            pass
-
-                    # Re-busca o estado atual da faixa de áudio APÓS o remove de vídeo.
-                    # BUG FIX: só remove se o clipe de áudio foi realmente cortado pelo razor.
-                    # Quando a cena não tem áudio, o razor não cria nenhum clipe novo no
-                    # audio track e audio_clips[-1] apontaria para o áudio de uma cena
-                    # anterior — que NÃO deve ser removido.
-                    audio_clips = pymiere.objects.app.project.activeSequence.audioTracks[
-                        mgr.SCENE_TRACK_INDEX].clips
-                    if len(audio_clips) > 0:
-                        last_audio = audio_clips[-1]
-                        try:
-                            if abs(last_audio.start.seconds - next_scene_start.seconds) < 0.1:
-                                last_audio.remove(False, False)
-                        except Exception:
-                            pass
+                    # AUDIO: corta apenas se a cena tem audio na trilha A0
+                    try:
+                        audio_clips = pymiere.objects.app.project.activeSequence.audioTracks[
+                            mgr.SCENE_TRACK_INDEX].clips
+                        if len(audio_clips) > 0:
+                            last_audio = audio_clips[-1]
+                            # So corta se o audio realmente se estende alem do ponto
+                            if last_audio.end.seconds > next_scene_start.seconds + 0.1:
+                                mgr._PremiereManager__qe_razor_with_retry(
+                                    track_type='audio', track_index=mgr.SCENE_TRACK_INDEX, timecode=timecode_to_cut)
+                                audio_clips = pymiere.objects.app.project.activeSequence.audioTracks[
+                                    mgr.SCENE_TRACK_INDEX].clips
+                                if len(audio_clips) > 0:
+                                    last_a = audio_clips[-1]
+                                    if abs(last_a.start.seconds - next_scene_start.seconds) < 0.15:
+                                        last_a.remove(False, False)
+                    except Exception:
+                        pass
 
             #     # Add zoom effect
                 # Usa inserted_scene_clips (já populado por _insert_scene_clip) em vez de
@@ -638,85 +775,132 @@ def mount_sequence(
         pymiere.objects.app.project.activeSequence.audioTracks[mgr.MUSIC_TRACK_INDEX].clips[-1].remove(
             False, True)
 
-    # Silence scenes track...
-    pymiere.objects.app.project.activeSequence.audioTracks[mgr.SCENE_TRACK_INDEX].setMute(
-        1)
+    # Volume da trilha de cenas sera aplicado no bloco MIXER abaixo
 
     # ==========================
-    # NOVO: FRASES IMPACTANTES (texto na tela)
+    # OVERLAY, LOGO, CTA (dentro de fast_ops para velocidade)
+    # Roda em paralelo com a renderização das frases impactantes
+    # ==========================
+
+    # Aguarda threads FFmpeg de overlay/logo (se ainda estiverem rodando)
+    _prerendered_overlay = ''
+    _prerendered_logo = ''
+
+    if _ffmpeg_overlay_future is not None:
+        try:
+            print("[ffmpeg-thread] aguardando overlay...")
+            _prerendered_overlay = _ffmpeg_overlay_future.result(timeout=300) or ''
+            print(f"[ffmpeg-thread] overlay pronto: {_prerendered_overlay}")
+        except Exception as e:
+            print(f"[ffmpeg-thread] erro no overlay: {e}")
+
+    if _ffmpeg_logo_future is not None:
+        try:
+            print("[ffmpeg-thread] aguardando logo...")
+            _prerendered_logo = _ffmpeg_logo_future.result(timeout=300) or ''
+            print(f"[ffmpeg-thread] logo pronto: {_prerendered_logo}")
+        except Exception as e:
+            print(f"[ffmpeg-thread] erro no logo: {e}")
+
+    if _ffmpeg_pool is not None:
+        _ffmpeg_pool.shutdown(wait=False)
+
+    with mgr.fast_ops():
+        if overlay_path and os.path.exists(overlay_path):
+            try:
+                script_name = os.path.basename(os.path.normpath(narration_base_path))
+                mgr._PremiereManager__insert_overlay_full(
+                    roteiro_name=script_name,
+                    seq_end_time=last_narration_end,
+                    paths_map=paths_map,
+                    project_item_cache=project_item_cache,
+                    overlay_path_override=overlay_path,
+                    prerendered_overlay_path=_prerendered_overlay
+                )
+            except Exception as e:
+                print(f"[overlay] erro: {e}")
+
+        if logo_path and os.path.exists(logo_path):
+            try:
+                script_name = os.path.basename(os.path.normpath(narration_base_path))
+                mgr._PremiereManager__insert_logo_full(
+                    logo_path=logo_path,
+                    logo_position=logo_position,
+                    seq_end_time=last_narration_end,
+                    paths_map=paths_map,
+                    project_item_cache=project_item_cache,
+                    dims_cache=dims_cache,
+                    roteiro_name=script_name,
+                    prerendered_logo_path=_prerendered_logo
+                )
+            except Exception as e:
+                print(f"[logo] erro: {e}")
+
+    # ==========================
+    # CTA INSCREVA-SE
+    # ==========================
+    if cta_enabled and not cta_anim_path:
+        print("[cta] AVISO: CTA ativado mas nenhum arquivo de animacao foi selecionado.")
+    if cta_enabled and cta_anim_path and not os.path.exists(cta_anim_path):
+        print(f"[cta] AVISO: arquivo nao encontrado: {cta_anim_path}")
+    if cta_enabled and cta_anim_path and os.path.exists(cta_anim_path):
+        try:
+            _insert_cta(
+                mgr=mgr,
+                cta_anim_path=cta_anim_path,
+                cta_chroma_key=cta_chroma_key,
+                transcriptions_by_file=transcriptions_by_file,
+                narration_offset_by_file=narration_offset_by_file,
+                sorted_narrations_files=sorted_narrations_files,
+                seq_end_seconds=last_narration_end.seconds,
+                paths_map=paths_map,
+                project_item_cache=project_item_cache,
+            )
+        except Exception as e:
+            print(f"[cta] erro: {e}")
+
+    # ==========================
+    # FRASES IMPACTANTES — Fase 2: Coleta dos .mov e inserção no Premiere
+    # ==========================
+    if _impact_future is not None:
+        try:
+            print("[impact] aguardando renderização FFmpeg...")
+            build_res = _impact_future.result(timeout=600)
+            if build_res.success and build_res.data:
+                print(f"[impact] overlays gerados: {len(build_res.data)}")
+                try:
+                    mgr._PremiereManager__ensure_video_track_index(mgr.IMPACT_TEXT_TRACK_INDEX)
+                except Exception:
+                    pass
+                with mgr.fast_ops():
+                    ins_res = _impact_tos.insert_overlays_into_premiere(
+                        premiere_mgr=mgr,
+                        overlays=build_res.data,
+                        track_index=mgr.IMPACT_TEXT_TRACK_INDEX
+                    )
+                if ins_res.success is False:
+                    print("[impact] erro ao inserir overlays:", ins_res.error)
+            elif build_res.success is False:
+                print("[impact] erro ao gerar overlays:", build_res.error)
+        except Exception as e:
+            print(f"[impact] excepcao: {e}")
+
+    if _impact_pool is not None:
+        _impact_pool.shutdown(wait=False)
+
+    # ==========================
+    # MIXER DE AUDIO (aplicar volumes em dB)
     # ==========================
     try:
-        cfg = impact_phrases_config or {}
-        if isinstance(cfg, dict) and cfg.get("enabled"):
-
-            # junta transcrições + offsets na MESMA ordem da montagem
-            t_list = []
-            off_list = []
-            for nf in sorted_narrations_files:
-                t = transcriptions_by_file.get(nf)
-                off = narration_offset_by_file.get(nf, None)
-                if t is None or off is None:
-                    continue
-                t_list.append(t)
-                off_list.append(float(off))
-
-            if t_list:
-
-                dims = Dimensions(mgr.FRAME_W, mgr.FRAME_H)
-
-                # salva overlays aqui:
-                # projeto/<nome_do_roteiro>/impact_text
-                script_name = os.path.basename(
-                    os.path.normpath(narration_base_path))
-                out_dir = os.path.join(
-                    mgr.CWD, "projeto", script_name, "impact_text")
-                os.makedirs(out_dir, exist_ok=True)
-
-                tos = TextOnScreenManager(openai_api_key=openai_api_key)
-
-                build_res = tos.build_text_overlays(
-                    transcriptions=t_list,
-                    offsets_seconds=off_list,
-                    dims=dims,
-                    output_dir=out_dir,
-                    mode=str(cfg.get("mode", "phrase")),
-                    max_phrases_total=int(cfg.get("max_phrases_total", 5)),
-                    min_gap_seconds=float(cfg.get("min_gap_seconds", 8.0)),
-                    fps="60000/1001",
-                    language="pt-BR",
-                    position=str(cfg.get("position", "bottom")),
-                    font_name=str(cfg.get("font_name", "")),
-                    font_file=str(cfg.get("font_file", "")),
-                    font_size_px=cfg.get("font_size_px", None),
-                )
-
-                if build_res.success and build_res.data:
-                    print(f"[impact] overlays gerados: {len(build_res.data)}")
-                    print("[impact] exemplo 1:", build_res.data[0])
-                    # garante que exista a trilha (track_index=3 = V4)
-                    try:
-                        mgr._PremiereManager__ensure_video_track_index(3)
-                    except Exception:
-                        pass
-
-                    with mgr.fast_ops():
-                        ins_res = tos.insert_overlays_into_premiere(
-                            premiere_mgr=mgr,
-                            overlays=build_res.data,
-                            track_index=3
-                        )
-                    if ins_res.success is False:
-                        print("[impact] erro ao inserir overlays:",
-                              ins_res.error)
-                else:
-                    if build_res.success is False:
-                        print("[impact] erro ao gerar overlays:",
-                              build_res.error)
-
+        print(f"[mixer] Aplicando volumes: cenas={vol_scene_db}dB, narracao={vol_narration_db}dB, cta={vol_cta_db}dB, musica={vol_music_db}dB")
+        mgr._PremiereManager__set_audio_track_volume_db(mgr.SCENE_TRACK_INDEX, vol_scene_db)
+        mgr._PremiereManager__set_audio_track_volume_db(mgr.NARRATION_TRACK_INDEX, vol_narration_db)
+        mgr._PremiereManager__set_audio_track_volume_db(mgr.CTA_AUDIO_TRACK_INDEX, vol_cta_db)
+        mgr._PremiereManager__set_audio_track_volume_db(mgr.MUSIC_TRACK_INDEX, vol_music_db)
     except Exception as e:
-        print("[impact] exceção:", e)
+        print(f"[mixer] erro: {e}")
 
-    # >>> APLICAR FADE POR BLOCO (somente se NÃO for imediato) <<<
+    # >>> APLICAR FADE POR BLOCO (somente se NAO for imediato) <<<
     if not apply_fade_immediately and fade_percentage > 0:
         for (first_c, last_c, fade_each) in fade_blocks:
             try:
@@ -745,6 +929,82 @@ def mount_sequence(
                 pass
 
     return Result(success=True)
+
+
+def _insert_cta(
+    mgr,
+    cta_anim_path: str,
+    cta_chroma_key: bool,
+    transcriptions_by_file: dict,
+    narration_offset_by_file: dict,
+    sorted_narrations_files: list,
+    seq_end_seconds: float,
+    paths_map: dict,
+    project_item_cache: dict,
+):
+    """
+    Detecta pedido de inscricao na transcricao e insere animacao CTA.
+    Se nao encontrar, insere em ponto aleatorio nos primeiros 3 minutos.
+    """
+    CTA_KEYWORDS = ('inscreva', 'inscrev', 'gostei', 'like', 'curtir', 'curta', 'canal')
+
+    # Busca timestamp do CTA na transcricao
+    cta_time_s = None
+    for nf in sorted_narrations_files:
+        t = transcriptions_by_file.get(nf)
+        offset = narration_offset_by_file.get(nf, 0.0)
+        if t is None:
+            continue
+        for word in (t.words if hasattr(t, 'words') else []):
+            text_lower = (word.text or '').lower()
+            for kw in CTA_KEYWORDS:
+                if kw in text_lower:
+                    cta_time_s = offset + (word.start / 1000.0)
+                    break
+            if cta_time_s is not None:
+                break
+        if cta_time_s is not None:
+            break
+
+    # Se nao encontrou, ponto aleatorio nos primeiros 3 min
+    if cta_time_s is None:
+        max_cta = min(180.0, seq_end_seconds * 0.8)
+        if max_cta > 10.0:
+            cta_time_s = random.uniform(10.0, max_cta)
+        else:
+            cta_time_s = 5.0
+
+    print(f"[cta] inserindo em {cta_time_s:.1f}s")
+
+    # Garante trilhas
+    mgr._PremiereManager__ensure_video_track_index(mgr.CTA_TRACK_INDEX)
+    mgr._PremiereManager__ensure_audio_track_index(mgr.CTA_AUDIO_TRACK_INDEX)
+
+    # Converte chroma key verde para canal alfa via FFmpeg (se ativado)
+    if cta_chroma_key:
+        cta_alpha_path = mgr._PremiereManager__chromakey_to_alpha(
+            os.path.normpath(cta_anim_path), key_color_hex="#00FF00")
+    else:
+        cta_alpha_path = os.path.normpath(cta_anim_path)
+
+    cta_src = paths_map.get(cta_alpha_path, cta_alpha_path)
+    imported = mgr._PremiereManager__get_or_import_project_item(
+        cta_src, project_item_cache)
+    if imported == mgr.PYMIERE_UNDEFINED:
+        print("[cta] nao foi possivel importar a animacao CTA.")
+        return
+
+    start_time = pymiere.wrappers.time_from_seconds(cta_time_s)
+
+    # Insere video na V3 (o Premiere automaticamente linka o audio na trilha correspondente)
+    mgr._PremiereManager__insert_clip_with_retry(
+        track_type='video',
+        track_index=mgr.CTA_TRACK_INDEX,
+        project_item=imported,
+        start_time=start_time
+    )
+
+    print(f"[cta] animacao inserida em V{mgr.CTA_TRACK_INDEX + 1} (com alfa)")
 
 
 def mount_mass_project(
@@ -1136,8 +1396,7 @@ def mount_mass_project(
                             last_music_end = music_clip.end
                             mi += 1
 
-                    pymiere.objects.app.project.activeSequence.audioTracks[mgr.SCENE_TRACK_INDEX].setMute(
-                        1)
+                    # Volume da trilha de cenas aplicado no bloco MIXER
 
                     # --- OVERLAY e LOGO ---
                     try:

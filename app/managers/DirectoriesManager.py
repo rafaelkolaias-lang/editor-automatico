@@ -49,7 +49,22 @@ class DirectoriesManager:
         {
             'name': 'partes',
             'creatable': True,
-            'readable': False  # não aparece no read_directories; vamos ler com método próprio
+            'readable': False  # nao aparece no read_directories; vamos ler com metodo proprio
+        },
+        {
+            'name': 'logo',
+            'creatable': True,
+            'readable': False
+        },
+        {
+            'name': 'overlay',
+            'creatable': True,
+            'readable': False
+        },
+        {
+            'name': 'animacao',
+            'creatable': True,
+            'readable': False
         }
     ]
 

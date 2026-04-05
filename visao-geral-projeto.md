@@ -233,8 +233,8 @@ Responsabilidades:
 * montar timeline
 * aplicar zoom
 * aplicar fade
-* inserir overlay
-* inserir logo
+* inserir overlay (com cache FFmpeg de 10min + renderização paralela)
+* inserir logo (com cache FFmpeg de 10min + renderização paralela)
 * exportar XML
 * salvar projeto
 * controlar retries e reconexão com `pymiere`
@@ -290,9 +290,20 @@ Opera em duas fases:
 
 **Fase 2 — Revisão:**
 * `PanedWindow` split-screen:
-  * **esquerda:** `Listbox` com frases coloridas em vermelho para "⚠ SEM CENA", filtros (Todos / Sem cena / Com cena), vínculo manual via combobox
-  * **direita:** `Canvas` com grid responsivo de cards de cena, thumbnails PIL para imagens, hover-play cv2 para vídeo (50ms/frame, 3-frame skip ≈ 2x velocidade)
-* botão `[✓ Aplicar Cópia de Arquivos]` → copia arquivos via `shutil.copy2` para a pasta de saída com nomes das frases
+  * **esquerda:** `Listbox` com frases coloridas em vermelho para "⚠ SEM CENA", filtros (Todos / Sem cena / Com cena), vínculo manual via clique no card
+  * **direita:** `Canvas` com grid responsivo de cards de cena, thumbnails PIL para imagens (carregamento progressivo em lotes), hover-play cv2 para vídeo
+* Auto-seleção: ao atribuir uma cena, a próxima frase sem cena é selecionada automaticamente
+* Carregamento progressivo: tela "Carregando revisão..." + thumbnails em lotes de 6 via `after(10)` (UI não trava)
+* botão `[✓ Aplicar Cópia de Arquivos]` → copia arquivos com nome baseado em N palavras da frase
+* botão `[Reprocessar Pendências]` → reprocessa apenas frases sem cena com score mais flexível
+* botão `[Desfazer Última]` → remove arquivos copiados na última execução
+
+**Controles de configuração:**
+* Palavras no nome (2-20): limita palavras no nome do arquivo copiado
+* Frases por item (1-5): agrupa frases do roteiro em blocos
+* Repetições (1-10): quantas vezes a mesma cena pode ser reutilizada
+* Permitir repetir cena (checkbox)
+* Tooltips **(?)** em todos os campos numéricos
 
 #### `WorkingScreen.py`
 
@@ -439,7 +450,7 @@ Na montagem principal, o sistema trabalha assim:
 * aplica fade por bloco
 * no fim insere música até cobrir toda a narração
 * corta a sobra da música
-* silencia o áudio das cenas
+* aplica os volumes definidos no Mixer de Áudio (Cenas A1, Narração A2, Inscreva-se A3, Música A5)
 
 ---
 
@@ -449,18 +460,20 @@ O mapeamento atual é este:
 
 ### Vídeo
 
-* **V0** → cenas
-* **V1** → logo
-* **V2** → overlay
-* **V3** → textos de impacto
+* **V1** (index 0) → cenas
+* **V3** (index 2) → CTA Inscreva-se
+* **V4** (index 3) → overlay
+* **V5** (index 4) → logo
+* **V6** (index 5) → frases impactantes (legendas)
 
 ### Áudio
 
-* **A0** → áudio das cenas
-* **A1** → narração
-* **A2** → música
+* **A1** (index 0) → áudio das cenas
+* **A2** (index 1) → narração
+* **A3** (index 2) → inscreva-se (CTA)
+* **A5** (index 4) → música
 
-O áudio das cenas é mutado no final da montagem.
+O volume de todas as trilhas é controlado pelo Mixer de Áudio na interface (em dB), convertido para ganho linear (`10^((dB - 15) / 20)`) antes de ser aplicado via `setValue` no Premiere.
 
 ---
 
@@ -500,37 +513,49 @@ Na interface existe também:
 
 ## Frases impactantes na tela
 
-Esse recurso existe e pode ser ativado no GUI.
+Recurso ativável no GUI com editor de estilos visual.
 
-### Como funciona hoje
+### Como funciona
 
-1. o sistema pega as transcrições e offsets reais de cada narração na timeline
-2. transforma em palavras absolutas
-3. monta segmentos por pausa
-4. filtra segmentos repetidos ou ruins
-5. envia candidatos para a OpenAI
-6. a OpenAI devolve os melhores trechos
-7. o sistema renderiza `.mov` transparentes com FFmpeg
-8. os overlays são inseridos no track de vídeo 3
+1. Offsets das narrações são **pré-calculados via ffprobe** (durações acumuladas)
+2. Seleção + renderização FFmpeg são submetidas em **thread paralela** (antes do loop de cenas)
+3. Transforma palavras transcritas em segmentos (corte por pontuação `.!?` com fallback por pausas)
+4. Filtra segmentos repetidos/ruins
+5. Envia candidatos para a OpenAI (ou reutiliza cache se "Usar cache" estiver habilitado)
+6. A OpenAI devolve os melhores trechos
+7. O sistema renderiza `.mov` com **canal alpha real** (QuickTime Animation qtrle+argb) via FFmpeg
+8. Os overlays são inseridos no track **V6** (index 5) com blend mode **Normal**
 
-### Configurações disponíveis
+### Editor de Estilos (`app/ui/dialogs/StyleEditorDialog.py`)
 
-* ativar ou desativar
-* modo:
+Interface visual para personalizar a aparência das frases:
 
-  * frase inteira
-  * palavra por palavra
-* máximo de frases no vídeo
-* intervalo mínimo entre frases
-* posição
-* fonte
-* tamanho da fonte
+* Cor da fonte e cor da borda (color picker)
+* Largura da borda (stroke) e sombra (X/Y)
+* Fundo (box) com opacidade
+* CAPS LOCK
+* Tamanho da fonte (slider 20-200px)
+* Posição (Baixo/Centro/Topo)
+* Animações: Nenhuma, Fade, Pop — com % de entrada/saída configurável
+* Preview em tempo real com animação em loop
+* Preview 1080p em janela separada
+* Salvar/carregar estilos em `assets/text_styles.json`
 
-### Saída dos textos
+### Configurações no GUI
 
-Os arquivos são salvos em:
+* Ativar/desativar
+* Usar cache (reutiliza frases salvas sem chamar OpenAI)
+* Modo: frase inteira ou palavra por palavra
+* Máximo de frases no vídeo
+* Intervalo mínimo entre frases (auto-ajustável se necessário)
+* Seletor de fonte
+* Seletor de estilo + botão "Editar Estilos" + botão "Preview 1080p"
+* Preview inline do estilo no frame (atualiza ao trocar estilo/fonte)
 
-* `projeto/<nome_do_roteiro>/impact_text/`
+### Cache
+
+* Seleção do GPT salva em `projeto/<roteiro>/impact_text/_impact_cache.json`
+* Renderings FFmpeg salvos como `.mov` em `projeto/<roteiro>/impact_text/`
 
 ---
 
@@ -594,10 +619,16 @@ Também existe leitura de estilo e duração para essas cartelas.
 
 ### Overlay e logo
 
-No modo em massa, o sistema pode inserir automaticamente:
+O sistema pode inserir automaticamente:
 
 * overlay em V2
-* logo em V1
+* logo em V5
+
+**Otimização com cache FFmpeg + threads paralelas:**
+
+* **Overlay:** o vídeo original (geralmente curto, ex: 10s) é estendido via FFmpeg (`-stream_loop`) para um vídeo de 10 minutos. O resultado é cacheado como `{nome}_10m.mp4` no diretório `overlay/`. Na segunda execução com o mesmo overlay, o cache é reutilizado instantaneamente.
+* **Logo:** a imagem/vídeo do logo é renderizada via FFmpeg como um vídeo de 10 minutos com o logo posicionado (canto escolhido) sobre fundo preto. Cacheado como `logo_10m_{posição}.mp4` no diretório `logo/`.
+* **Renderização paralela:** ambos os FFmpeg são disparados em threads (`ThreadPoolExecutor(2)`) no início da montagem, rodando em paralelo com a inserção das cenas na timeline. Ao final, os resultados são coletados e os vídeos pré-renderizados são inseridos com muito menos chamadas IPC ao Premiere.
 
 A configuração de opacidade e modo de mesclagem pode ser lida de arquivos como:
 
@@ -643,6 +674,7 @@ Armazena o estado do último uso da interface, incluindo:
 * roteiro selecionado
 * ordem do modo em massa
 * duração mínima e máxima das cenas
+* volumes do mixer: `vol_scene`, `vol_narration`, `vol_cta`, `vol_music`
 
 ---
 
@@ -704,6 +736,7 @@ Ele inclui:
 * reimportação
 * polling de indexação
 * operações rápidas em lote com `fast_ops()`
+* renderização FFmpeg paralela para overlay/logo (cache persistente + threads)
 
 Também há tratamento de erro global no Tkinter e gravação de logs de crash.
 
@@ -744,3 +777,7 @@ Sistema local em Python que automatiza edição no Premiere a partir de uma orga
 No fluxo principal: pega narrações, cenas e músicas → transcreve com AssemblyAI → casa cenas com fala via OpenAI (semântico, fallback literal) → monta timeline no Premiere com zoom, fade, música e textos de impacto opcionais.
 
 No fluxo de renomeação (integrado): descreve cenas com Gemini → gera embeddings → casamento global otimizado → revisão visual com split-screen → cópia controlada para pasta de saída.
+
+**Última atualização (2026-04-04):** Editor de Estilos (cor, borda, animação %, preview 1080p), alpha real (qtrle), frases em paralelo com cenas, cache GPT, mixer corrigido (dB→linear, Cenas A1 default -99 dB), auto-check Premiere, tooltips (?), renomeador avançado (palavras/nome, frases/item, repetições, reprocessar, desfazer, carregamento progressivo 16:9, auto-seleção, nomes sem prefixo numérico), logo proporcional à resolução, importação única de arquivos (sem duplicação).
+
+

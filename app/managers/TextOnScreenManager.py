@@ -290,6 +290,12 @@ class TextOnScreenManager:
     # -----------------------------
     # 1) Criar "segmentos" a partir da transcrição
     # -----------------------------
+    @staticmethod
+    def __ends_sentence(word_text: str) -> bool:
+        """Verifica se a palavra termina uma frase (pontuação final)."""
+        t = (word_text or "").strip()
+        return t.endswith(('.', '!', '?', '...', '."', '!"', '?"'))
+
     def __build_segments_from_words(
         self,
         words: List[TranscriptionWord],
@@ -299,9 +305,9 @@ class TextOnScreenManager:
         max_words: int = 30
     ) -> List[Dict[str, Any]]:
         """
-        Monta segmentos a partir de pausas (silêncios).
-        Regra importante: evita criar segmentos que começam "no meio" só por estourar max_words.
-        Se o trecho ficar longo demais, só divide se houver uma pausa interna razoável.
+        Monta segmentos a partir de limites de frase (pontuação) e pausas (silêncios).
+        Prioridade: cortar em pontuação final (.!?) para gerar frases completas.
+        Fallback: cortar em pausas longas se não houver pontuação.
         """
         if not words:
             return []
@@ -309,7 +315,6 @@ class TextOnScreenManager:
         segments: List[Dict[str, Any]] = []
         cur: List[TranscriptionWord] = []
 
-        # pausa interna mínima para permitir "corte" seguro
         split_gap_ms = max(250, gap_ms // 2)
 
         def add_chunk(chunk: List[TranscriptionWord]):
@@ -334,24 +339,28 @@ class TextOnScreenManager:
 
             remaining = cur
 
-            # Enquanto sobrar texto, tenta dividir apenas em pausas internas "boas"
             while remaining:
                 if len(remaining) <= max_words:
                     add_chunk(remaining)
                     break
 
-                # procura uma pausa grande dentro do primeiro "max_words" (de trás pra frente)
+                # 1) Procura pontuação final dentro do range max_words (de trás pra frente)
                 cut = None
                 search_end = min(max_words - 1, len(remaining) - 2)
-                for i in range(search_end, -1, -1):
-                    gap = int(remaining[i + 1].start) - int(remaining[i].end)
-                    if gap >= split_gap_ms:
+                for i in range(search_end, min_words - 1, -1):
+                    if self.__ends_sentence((remaining[i].text or "")):
                         cut = i + 1
                         break
 
+                # 2) Fallback: procura pausa longa
                 if cut is None:
-                    # não existe pausa interna boa → NÃO cria pedaços do meio.
-                    # cria só o começo (começa certo) e para (evita fragmento fora de contexto).
+                    for i in range(search_end, -1, -1):
+                        gap = int(remaining[i + 1].start) - int(remaining[i].end)
+                        if gap >= split_gap_ms:
+                            cut = i + 1
+                            break
+
+                if cut is None:
                     add_chunk(remaining[:max_words])
                     break
 
@@ -365,6 +374,11 @@ class TextOnScreenManager:
             if w is None or w.text is None or w.start is None or w.end is None:
                 continue
 
+            # Flush no limite de frase (pontuação) se já temos palavras suficientes
+            if cur and self.__ends_sentence((cur[-1].text or "")) and len(cur) >= min_words:
+                flush()
+
+            # Flush em pausas longas
             if last_end is not None and int(w.start) - int(last_end) >= gap_ms:
                 flush()
 
@@ -406,8 +420,8 @@ class TextOnScreenManager:
             if any(re.match(p, key) for p in bad_patterns):
                 continue
 
-            # evita segmentos muito curtos (ex: 2-3 palavras)
-            if len(t.split()) < 5:
+            # evita segmentos muito curtos (1 palavra isolada)
+            if len(t.split()) < 2:
                 continue
 
             # remove linhas com muitos dígitos (geralmente nomes de arquivo / timestamps)
@@ -440,7 +454,7 @@ class TextOnScreenManager:
         if not segments:
             return []
 
-        cap = min(len(segments), 80)
+        cap = min(len(segments), 150)
         segs = segments[:cap]
 
         items = []
@@ -455,11 +469,12 @@ class TextOnScreenManager:
             "Você escolhe trechos de fala para virar TEXTO NA TELA em um vídeo.\n"
             "Regras:\n"
             f"- Idioma: {language}\n"
-            f"- Escolha no máximo {max_phrases}.\n"
+            f"- Escolha exatamente {max_phrases} trechos (ou o máximo disponível se houver menos candidatos).\n"
             f"- Evite escolher trechos a menos de {min_gap_ms/1000:.1f}s um do outro.\n"
-            "- Escolha somente trechos que sejam uma IDEIA COMPLETA.\n"
-            "- Evite fragmentos que pareçam começar no meio.\n"
+            "- Escolha somente trechos que sejam uma FRASE COMPLETA (do início ao ponto final).\n"
+            "- NUNCA escolha fragmentos que comecem ou terminem no meio de uma frase.\n"
             "- Evite muletas/genericões (ex: 'e aí galera', 'vamos lá', 'tipo assim').\n"
+            "- IMPORTANTE: tente preencher o máximo de trechos pedido, distribuindo ao longo do vídeo inteiro.\n"
             "\n"
             "Para cada item escolhido, gere 'overlay_text' assim:\n"
             "- Mesmas palavras (não invente), mas pode ajustar:\n"
@@ -506,7 +521,7 @@ class TextOnScreenManager:
                 }
             },
             "temperature": 0.2,
-            "max_output_tokens": 600,
+            "max_output_tokens": 2000,
             "store": False
         }
 
@@ -623,6 +638,14 @@ class TextOnScreenManager:
     ) -> List[Dict[str, Any]]:
         min_gap_ms = int(max(0.0, min_gap_seconds) * 1000)
 
+        # Se o gap minimo x max_phrases > duracao total, reduz o gap automaticamente
+        if segments:
+            total_dur_ms = segments[-1]["end_ms"] - segments[0]["start_ms"]
+            needed_ms = min_gap_ms * max_phrases
+            if needed_ms > total_dur_ms and max_phrases > 1:
+                min_gap_ms = max(2000, int(total_dur_ms / (max_phrases + 1)))
+                print(f"[impact] gap ajustado para {min_gap_ms/1000:.1f}s (duracao total: {total_dur_ms/1000:.0f}s, frases: {max_phrases})")
+
         chosen = self.__openai_select_segments(
             segments,
             max_phrases=max_phrases,
@@ -718,29 +741,45 @@ class TextOnScreenManager:
         dims: Dimensions,
         fps: str = "60000/1001",
         font_size: Optional[int] = None,
-        # NOVO
         font_name: str = "",
         font_file: str = "",
         y_pos: str = "(h-text_h)/2",
         box: bool = True,
-        debug_dir: Optional[str] = None
+        debug_dir: Optional[str] = None,
+        style: Optional[Dict[str, Any]] = None
     ) -> bool:
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
         W, H = int(dims.width), int(dims.height)
         duration_s = max(0.05, float(duration_s))
 
-        # tamanho vindo do GUI (se None, mantém automático)
+        # Estilo (defaults seguros)
+        st = style or {}
+        font_color = st.get("font_color", "#FFFFFF")
+        border_color = st.get("border_color", "#000000")
+        border_width = int(st.get("border_width", 4))
+        shadow_x = int(st.get("shadow_x", 2))
+        shadow_y = int(st.get("shadow_y", 2))
+        shadow_color = st.get("shadow_color", "#000000")
+        shadow_opacity = float(st.get("shadow_opacity", 0.55))
+        box_enabled = st.get("box_enabled", box)
+        box_color = st.get("box_color", "#000000")
+        box_opacity = float(st.get("box_opacity", 0.35))
+        caps_lock = st.get("caps_lock", False)
+        animation = st.get("animation", "none")
+
+        if caps_lock:
+            text = text.upper()
+
         if font_size is None:
             font_size = max(28, int(H * 0.07))
         else:
-            font_size = max(12, min(200, int(font_size)))
+            font_size = max(12, min(400, int(font_size)))
 
         max_chars = max(18, int(W / 75))
         wrapped = self.__wrap_text(text, max_chars=max_chars)
         wrapped = self.__sanitize_overlay_text(wrapped)
 
-        # (pode manter o _txt por debug)
         txt_dir = os.path.join(os.path.dirname(out_path), "_txt")
         os.makedirs(txt_dir, exist_ok=True)
         txt_file = os.path.join(txt_dir, f"{self.__safe_slug(text)}.txt")
@@ -760,7 +799,6 @@ class TextOnScreenManager:
 
         auto_fontfile = self.__find_fontfile()
 
-        # --- Multi-line sem quadradinho: 1 drawtext por linha ---
         lines = [ln.strip()
                  for ln in (wrapped or "").split("\n") if ln.strip()]
         if not lines:
@@ -795,19 +833,19 @@ class TextOnScreenManager:
             opts += [
                 "expansion=none",
                 f"fontsize={int(font_size)}",
-                "fontcolor=white@1.0",
-                "borderw=4",
-                "bordercolor=black@0.85",
-                "shadowx=2",
-                "shadowy=2",
-                "shadowcolor=black@0.55",
+                f"fontcolor={font_color}@1.0",
+                f"borderw={border_width}",
+                f"bordercolor={border_color}@0.85",
+                f"shadowx={shadow_x}",
+                f"shadowy={shadow_y}",
+                f"shadowcolor={shadow_color}@{shadow_opacity:.2f}",
                 "x=(w-text_w)/2",
             ]
 
-            if box:
+            if box_enabled:
                 opts += [
                     "box=1",
-                    "boxcolor=black@0.35",
+                    f"boxcolor={box_color}@{box_opacity:.2f}",
                     "boxborderw=18",
                 ]
 
@@ -821,23 +859,40 @@ class TextOnScreenManager:
             filters.append("drawtext=" + ":".join(opts))
 
         draw_filter = ",".join(filters)
+
+        # Animação fade in/out (% da duração total)
+        anim_in_pct = max(5, int(st.get("anim_in_pct", 10))) / 100.0
+        anim_out_pct = max(5, int(st.get("anim_out_pct", 10))) / 100.0
+
+        if animation == "fade":
+            d_in = max(0.05, duration_s * anim_in_pct)
+            d_out = max(0.05, duration_s * anim_out_pct)
+            out_start = max(0.05, duration_s - d_out)
+            draw_filter += f",fade=t=in:st=0:d={d_in:.3f}:alpha=1,fade=t=out:st={out_start:.3f}:d={d_out:.3f}:alpha=1"
+        elif animation == "pop":
+            d_in = max(0.05, duration_s * anim_in_pct * 0.5)  # pop entra mais rapido
+            d_out = max(0.05, duration_s * anim_out_pct)
+            out_start = max(0.05, duration_s - d_out)
+            draw_filter += f",fade=t=in:st=0:d={d_in:.3f}:alpha=1,fade=t=out:st={out_start:.3f}:d={d_out:.3f}:alpha=1"
+
         size = f"{W}x{H}"
         base_input = f"color=c=black@0.0:s={size}:r={fps}:d={duration_s:.3f}"
 
+        # PNG codec em MOV — melhor compatibilidade com Premiere no Windows
         cmd1 = [
             self.FFMPEG_BIN, "-y",
             "-f", "lavfi", "-i", base_input,
             "-vf", draw_filter,
-            "-c:v", "prores_ks",
-            "-profile:v", "4444",
-            "-pix_fmt", "yuva444p10le",
+            "-c:v", "png",
+            "-pix_fmt", "rgba",
             "-t", f"{duration_s:.3f}",
             out_path
         ]
-        ok = self.__run_ffmpeg(cmd1, debug_dir=debug_dir, tag="prores4444")
+        ok = self.__run_ffmpeg(cmd1, debug_dir=debug_dir, tag="png_rgba")
         if ok and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
             return True
 
+        # Fallback qtrle
         cmd2 = [
             self.FFMPEG_BIN, "-y",
             "-f", "lavfi", "-i", base_input,
@@ -863,6 +918,7 @@ class TextOnScreenManager:
         font_name: str = "",
         font_file: str = "",
         font_size_px: Optional[int] = None,
+        text_style: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         os.makedirs(output_dir, exist_ok=True)
         debug_dir = os.path.join(output_dir, "_ffmpeg_logs")
@@ -899,12 +955,13 @@ class TextOnScreenManager:
                     duration_s=duration_s,
                     dims=dims,
                     fps=fps,
-                    font_size=font_size_px,   # NOVO (None = automático)
-                    font_name=font_name,      # NOVO
-                    font_file=font_file,      # NOVO
+                    font_size=font_size_px,
+                    font_name=font_name,
+                    font_file=font_file,
                     y_pos=y_pos,
                     box=True,
-                    debug_dir=debug_dir
+                    debug_dir=debug_dir,
+                    style=text_style,
                 )
 
                 overlays.append({
@@ -918,6 +975,8 @@ class TextOnScreenManager:
                     w_text = (w.text or '').strip()
                     if not w_text:
                         continue
+                    # Primeira letra maiúscula em cada palavra
+                    w_text = w_text[0].upper() + w_text[1:] if len(w_text) > 1 else w_text.upper()
 
                     start_ms = int(w.start)
                     end_ms = int(w.end)
@@ -932,12 +991,13 @@ class TextOnScreenManager:
                         duration_s=duration_s,
                         dims=dims,
                         fps=fps,
-                        font_size=font_size_px,  # NOVO
-                        font_name=font_name,     # NOVO
-                        font_file=font_file,     # NOVO
+                        font_size=font_size_px,
+                        font_name=font_name,
+                        font_file=font_file,
                         y_pos=y_pos,
                         box=True,
-                        debug_dir=debug_dir
+                        debug_dir=debug_dir,
+                        style=text_style,
                     )
 
                     overlays.append({
@@ -973,41 +1033,99 @@ class TextOnScreenManager:
         font_name: str = "",
         font_file: str = "",
         font_size_px: Optional[int] = None,
+        text_style: Optional[Dict[str, Any]] = None,
+        use_cache: bool = False,
     ) -> Result[List[Dict[str, Any]]]:
         try:
             if len(transcriptions) != len(offsets_seconds):
                 return Result(success=False, error='transcriptions e offsets_seconds precisam ter o mesmo tamanho.')
 
-            all_words_abs: List[TranscriptionWord] = []
-            for t, off_s in zip(transcriptions, offsets_seconds):
-                if t is None or not t.words:
-                    continue
-                off_ms = int(float(off_s) * 1000)
-                for w in t.words:
-                    if w is None or w.start is None or w.end is None:
+            # Caminho do cache de frases selecionadas
+            cache_path = os.path.join(output_dir, "_impact_cache.json")
+
+            # Tentar carregar cache se habilitado
+            selected = None
+            if use_cache and os.path.exists(cache_path):
+                try:
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        cached = json.load(f)
+                    if isinstance(cached, list) and cached:
+                        # Reconstituir words como TranscriptionWord para render_overlays
+                        for seg in cached:
+                            if "words" in seg:
+                                seg["words"] = [
+                                    TranscriptionWord(text=w["text"], start=w["start"], end=w["end"])
+                                    for w in seg["words"]
+                                ]
+                        selected = cached
+                        print(f"[impact] cache carregado: {len(selected)} frases de {cache_path}")
+                except Exception as e:
+                    print(f"[impact] cache invalido, recriando: {e}")
+
+            if selected is None:
+                all_words_abs: List[TranscriptionWord] = []
+                for t, off_s in zip(transcriptions, offsets_seconds):
+                    if t is None or not t.words:
                         continue
-                    all_words_abs.append(TranscriptionWord(
-                        text=w.text,
-                        start=int(w.start) + off_ms,
-                        end=int(w.end) + off_ms
-                    ))
+                    off_ms = int(float(off_s) * 1000)
+                    for w in t.words:
+                        if w is None or w.start is None or w.end is None:
+                            continue
+                        all_words_abs.append(TranscriptionWord(
+                            text=w.text,
+                            start=int(w.start) + off_ms,
+                            end=int(w.end) + off_ms
+                        ))
 
-            all_words_abs.sort(key=lambda w: (w.start, w.end))
+                all_words_abs.sort(key=lambda w: (w.start, w.end))
 
-            segments = self.__build_segments_from_words(
-                all_words_abs,
-                gap_ms=segment_gap_ms,
-                min_words=segment_min_words,
-                max_words=segment_max_words
-            )
-            segments = self.__filter_segments(segments)
+                effective_gap_ms = segment_gap_ms
+                effective_min_words = 2 if mode == "word" else segment_min_words
+                effective_max_words = max(segment_max_words, 30)
 
-            selected = self.select_impact_phrases(
-                segments,
-                max_phrases=max_phrases_total,
-                min_gap_seconds=min_gap_seconds,
-                language=language
-            )
+                has_punctuation = any(
+                    self.__ends_sentence((w.text or ""))
+                    for w in all_words_abs[:200]
+                )
+                if not has_punctuation:
+                    print("[impact] AVISO: transcrição sem pontuação (cache antigo). "
+                          "Apague o .json da transcrição para re-transcrever com pontuação.")
+
+                segments = self.__build_segments_from_words(
+                    all_words_abs,
+                    gap_ms=effective_gap_ms,
+                    min_words=effective_min_words,
+                    max_words=effective_max_words
+                )
+                segments_before_filter = len(segments)
+                segments = self.__filter_segments(segments)
+                print(f"[impact] modo={mode} | {len(all_words_abs)} palavras -> {segments_before_filter} segmentos brutos -> {len(segments)} apos filtro")
+
+                selected = self.select_impact_phrases(
+                    segments,
+                    max_phrases=max_phrases_total,
+                    min_gap_seconds=min_gap_seconds,
+                    language=language
+                )
+                print(f"[impact] {len(selected)} frases selecionadas de {len(segments)} candidatos")
+
+                # Salvar cache (serializar words)
+                try:
+                    cache_data = []
+                    for seg in selected:
+                        seg_copy = dict(seg)
+                        if "words" in seg_copy:
+                            seg_copy["words"] = [
+                                {"text": w.text, "start": w.start, "end": w.end}
+                                for w in seg_copy["words"]
+                            ]
+                        cache_data.append(seg_copy)
+                    os.makedirs(output_dir, exist_ok=True)
+                    with open(cache_path, "w", encoding="utf-8") as f:
+                        json.dump(cache_data, f, indent=2, ensure_ascii=False)
+                    print(f"[impact] cache salvo: {cache_path}")
+                except Exception as e:
+                    print(f"[impact] erro ao salvar cache: {e}")
 
             overlays_ms = self.render_overlays(
                 selected,
@@ -1016,10 +1134,10 @@ class TextOnScreenManager:
                 fps=fps,
                 output_dir=output_dir,
                 position=position,
-                # NOVO
                 font_name=font_name,
                 font_file=font_file,
                 font_size_px=font_size_px,
+                text_style=text_style,
             )
 
             overlays = []
@@ -1072,52 +1190,8 @@ class TextOnScreenManager:
 
             import pymiere
 
-            # -----------------------------
-            # Descobrir o nome do roteiro pra ler overlay.txt
-            # -----------------------------
-            def _infer_roteiro_name() -> str:
-                # 1) tenta inferir pelo caminho do primeiro .mov:
-                # .../projeto/<roteiro_name>/impact_text/arquivo.mov
-                try:
-                    p0 = (overlays[0].get("path") or "")
-                    if p0:
-                        parts = os.path.abspath(p0).replace(
-                            "\\", "/").split("/")
-                        if "projeto" in parts:
-                            i = parts.index("projeto")
-                            if i + 1 < len(parts):
-                                return (parts[i + 1] or "").strip()
-                except Exception:
-                    pass
-
-                # 2) fallback: nome da sequência ativa
-                try:
-                    seq = pymiere.objects.app.project.activeSequence
-                    if seq and getattr(seq, "name", None):
-                        return (seq.name or "").strip()
-                except Exception:
-                    pass
-
-                return ""
-
-            roteiro_name = _infer_roteiro_name()
-
-            # -----------------------------
-            # Pegar OPACITY + BLEND MODE do overlay.txt (mesmo esquema do overlay)
-            # -----------------------------
             opacity = 100.0
-            blend_mode = "22"  # default do seu parse: Screen
-
-            if roteiro_name:
-                try:
-                    op, bm = premiere_mgr._PremiereManager__parse_overlay_cfg(
-                        roteiro_name)
-                    if op is not None:
-                        opacity = float(op)
-                    if bm:
-                        blend_mode = str(bm)
-                except Exception:
-                    pass
+            blend_mode = "Normal"  # Alpha real via ProRes 4444 — sem precisar de Screen
 
             cache = {}
 

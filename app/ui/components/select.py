@@ -11,14 +11,13 @@ class SelectComponent:
     DEFAULT_OPTION_TEXT = "Selecione uma opção"
     NO_OPTIONS_TEXT = "Não há opções disponíveis"
 
-    def __init__(self, parent: tk.Widget, label_text: str, *, no_options_text: str | None = None):
+    def __init__(self, parent: tk.Widget, label_text: str, *, no_options_text: str | None = None, horizontal: bool = False):
         self.label_text = label_text
 
-        # garante atributos mesmo se alguém apagar as constantes da classe
         self.DEFAULT_OPTION_TEXT = getattr(
-            self, "DEFAULT_OPTION_TEXT", "Selecione uma opção")
+            self, "DEFAULT_OPTION_TEXT", "Selecione uma opcao")
         self.NO_OPTIONS_TEXT = getattr(
-            self, "NO_OPTIONS_TEXT", "Não há opções disponíveis")
+            self, "NO_OPTIONS_TEXT", "Nao ha opcoes disponiveis")
 
         self.no_options_text = (
             no_options_text or "").strip() or self.NO_OPTIONS_TEXT
@@ -26,15 +25,20 @@ class SelectComponent:
         self.widget = tk.Frame(parent)
 
         self.label = tk.Label(self.widget, text=self.label_text)
-        self.label.pack(anchor="w")
+        if horizontal:
+            self.label.pack(side="left", padx=(0, 4))
+        else:
+            self.label.pack(anchor="w")
 
         self.options: list[str] = []
         self.selected_option = tk.StringVar(value=self.DEFAULT_OPTION_TEXT)
 
-        # cria o OptionMenu já com 1 item (evita menu “vazio” bugado)
         self.select = tk.OptionMenu(
             self.widget, self.selected_option, self.DEFAULT_OPTION_TEXT)
-        self.select.pack(fill="x")
+        if horizontal:
+            self.select.pack(side="left", fill="x", expand=True)
+        else:
+            self.select.pack(fill="x")
 
     def set_options(self, options: list[str] | None, *, selected: str | None = None):
         """

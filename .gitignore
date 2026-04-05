@@ -31,3 +31,16 @@ __pycache__/
 *.pyc
 *.pyo
 .env
+
+# Temporários e gerados
+temp_gh_code/
+temp_gh_dir/
+.agents/
+agents/
+logo/
+overlay/
+animacao/
+projeto/
+
+# Debug
+debug.py

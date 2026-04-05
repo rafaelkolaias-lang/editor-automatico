@@ -18,6 +18,9 @@ from pathlib import Path
 import requests
 from requests.adapters import HTTPAdapter
 from .SettingsManager import get_runtime_root as _settings_runtime_root
+
+# Flag para ocultar janela de console do FFmpeg no Windows
+_FFMPEG_CREATE_FLAGS = 0x08000000 if sys.platform == 'win32' else 0
 from ..utils import debug_print
 from ..utils.debug_print import debug_print
 
@@ -58,22 +61,30 @@ class PremiereManager():
     PYMIERE_UNDEFINED = 'undefined'
     PREMIERE_MOVEMENT_EFFECT_NAME = 'Movimento'
     PREMIERE_SCALE_PROPERTY_NAME = 'Escala'
+    # ── Trilhas de audio ──
+    # A0(idx 0) = audio da cena (mudo automatico)
+    # A1(idx 1) = narracao   A2(idx 2) = som CTA inscreva-se (linkado)
+    # A3(idx 3) = audio overlay (linkado)   A4(idx 4) = musica
     SCENE_TRACK_INDEX = 0
     NARRATION_TRACK_INDEX = 1
-    MUSIC_TRACK_INDEX = 2
+    CTA_AUDIO_TRACK_INDEX = 2
+    MUSIC_TRACK_INDEX = 4
 
-    # ⇩⇩ NOVO: resolução-alvo da sequência e da geração via FFmpeg
     FRAME_W = 1920
     FRAME_H = 1080
 
-    LOGO_TRACK_INDEX = 1          # V1 (acima das cenas em V0)
-    OVERLAY_TRACK_INDEX = 2       # V2 (precisa ficar acima de tudo)
+    # ── Trilhas de video ──
+    # V1(0)=Cenas  V2(1)=CTA  V3(2)=(livre)  V4(3)=Overlay  V5(4)=Logo  V6(5)=Frases impactantes
+    CTA_TRACK_INDEX = 2           # V3: Botao Inscreva-se
+    OVERLAY_TRACK_INDEX = 3       # V4: Overlay
+    LOGO_TRACK_INDEX = 4          # V5: Logo
+    IMPACT_TEXT_TRACK_INDEX = 5   # V6: Frases impactantes / legendas
     LOGO_MARGIN_PX = 30           # margem do logo nas bordas
     # LOGO_TARGET_HEIGHT_PX = 120   # altura padrão do logo (ajuste se quiser)
     LOGO_FIXED_SCALE_PERCENT = 12.0  # escala fixa do logo (Motion > Scale)
 
     ULTRA_KEY_ENABLE = False              # ativa/desativa o Ultra Key
-    ULTRA_KEY_COLOR_HEX = "#000000"      # cor a ser “chaveada”
+    ULTRA_KEY_COLOR_HEX = "#000000"      # cor a ser "chaveada"
 
     BLEND_SCREEN_ENUM = 22  # ajuste para o valor do modo de mesclagem desejado
     # 7 = exclusão | 2 = Sobexposição de cor | 3 = Escurecer | 4 = cor mais escura | 5 = Diferença | 6 = Dissolver | 8 = Luz intensa | 9 =
@@ -84,14 +95,14 @@ class PremiereManager():
     BLEND_DEBUG_WAIT_SECONDS = 5.0        # segundos de espera por número
 
     # ====== Resiliência p/ chamadas pymiere (timeouts, ECONNRESET etc.) ======
-    MAX_RETRIES = 6
+    MAX_RETRIES = 4
     RETRY_BACKOFF_BASE = 0.3
     RETRY_BACKOFF_CAP = 2.5
     RETRY_JITTER = (0.0, 0.2)
-    HEARTBEAT_EVERY = 5000
-    AUTOSAVE_EVERY_OPS = 5000
-    # ~10 ms entre chamadas: suficiente com keep-alive
-    REQUEST_THROTTLE_SECONDS = 0.01
+    HEARTBEAT_EVERY = 10000
+    AUTOSAVE_EVERY_OPS = 10000
+    # ~4 ms entre chamadas: seguro com keep-alive ativo
+    REQUEST_THROTTLE_SECONDS = 0.004
     # ⛔ REMOVIDO: HARD_RESET_EVERY_CALLS / HARD_RESET_SLEEP_SECONDS
 
     _ops_since_save = 0
@@ -183,7 +194,7 @@ class PremiereManager():
         Reinício suave da ponte com o painel (porta 3000):
         - zera contadores locais,
         - espera RESET_SLEEP_SECONDS,
-        - tenta “pingar” o app,
+        - tenta "pingar" o app,
         - como último recurso, recarrega o módulo pymiere.
         Retorna True se, ao final, o painel estiver respondendo.
         """
@@ -191,7 +202,7 @@ class PremiereManager():
             # zera contadores locais que poderiam enfileirar saves/heartbeats
             self._ops_since_save = 0
 
-            # 1) tenta apenas “pingar” o painel
+            # 1) tenta apenas "pingar" o painel
             try:
                 _ = pymiere.objects.app.isDocumentOpen()
                 return True
@@ -204,7 +215,7 @@ class PremiereManager():
                 import gc
                 gc.collect()
                 importlib.reload(pymiere)
-                # “acorda” objetos
+                # "acorda" objetos
                 _ = pymiere.objects.app.isDocumentOpen()
                 return True
             except Exception:
@@ -297,10 +308,14 @@ class PremiereManager():
             if not dedupe_last:
                 return None
             try:
-                clips = list(track.clips)
-                rng = clips[-2:] if len(clips) >= 2 else clips
+                # Usa len + indice ao inves de list() para evitar O(N) IPC
+                n = len(track.clips)
+                if n == 0:
+                    return None
                 s_target = float(getattr(start_time, 'seconds', 0.0))
-                for c in rng:
+                # Checa apenas os ultimos 2 clips (indice direto, sem list)
+                for idx in range(max(0, n - 2), n):
+                    c = track.clips[idx]
                     s = float(getattr(c.start, 'seconds', 0.0))
                     if abs(s - s_target) <= 0.08:
                         pi = getattr(c, 'projectItem', None)
@@ -349,7 +364,7 @@ class PremiereManager():
             if ex:
                 return ex
 
-            # Preferir OVERWRITE para não “empurrar” o que já existe na timeline
+            # Preferir OVERWRITE para não "empurrar" o que já existe na timeline
             if hasattr(t, 'overwriteClip'):
                 t.overwriteClip(project_item, start_time)
             else:
@@ -450,10 +465,23 @@ class PremiereManager():
         fill_gaps_with_random_scenes: bool = False,
         max_fill_scene_duration: float = 0.0,
 
-        # NOVO
         narrations_transcriptions: Optional[list[Any]] = None,
         impact_phrases_config: Optional[dict] = None,
-        openai_api_key: str = ''
+        openai_api_key: str = '',
+
+        # Recursos visuais
+        logo_path: str = '',
+        logo_position: str = 'bottom_right',
+        overlay_path: str = '',
+        cta_enabled: bool = False,
+        cta_anim_path: str = '',
+        cta_chroma_key: bool = True,
+
+        # Mixer (dB)
+        vol_scene_db: float = 0.0,
+        vol_narration_db: float = 0.0,
+        vol_cta_db: float = -9.0,
+        vol_music_db: float = -12.0,
     ) -> Result[None]:
         from .premiere import editing
         return editing.mount_sequence(
@@ -473,10 +501,21 @@ class PremiereManager():
             fill_gaps_with_random_scenes=fill_gaps_with_random_scenes,
             max_fill_scene_duration=max_fill_scene_duration,
 
-            # NOVO
             narrations_transcriptions=narrations_transcriptions,
             impact_phrases_config=impact_phrases_config,
-            openai_api_key=openai_api_key
+            openai_api_key=openai_api_key,
+
+            logo_path=logo_path,
+            logo_position=logo_position,
+            overlay_path=overlay_path,
+            cta_enabled=cta_enabled,
+            cta_anim_path=cta_anim_path,
+            cta_chroma_key=cta_chroma_key,
+
+            vol_scene_db=vol_scene_db,
+            vol_narration_db=vol_narration_db,
+            vol_cta_db=vol_cta_db,
+            vol_music_db=vol_music_db,
         )
 
     @contextmanager
@@ -582,7 +621,7 @@ class PremiereManager():
             ]
             print(f"[logo60] ffmpeg start (mp4, {fps}fps) -> {out_path}")
             proc = subprocess.run(
-                cmd, check=False, capture_output=True, text=True)
+                cmd, check=False, capture_output=True, text=True, creationflags=_FFMPEG_CREATE_FLAGS)
             self.__write_ffmpeg_debug(
                 out_dir, cmd, proc, f'logo_60s_mp4_{fps}fps')
             if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
@@ -958,20 +997,51 @@ class PremiereManager():
                     uk = comp
                     break
 
-            # 2) se não existe, tenta adicionar por nome e re-checar com polling
+            # 2) se nao existe, tenta adicionar por nome/matchName e re-checar
             if uk is None:
                 added = False
-                for name in ('ADBE UltraKey', 'Ultra Key', 'Chave Ultra'):
+                # Nomes possiveis: matchName (ADBE), EN, PT-BR
+                effect_names = (
+                    'ADBE UltraKey',
+                    'AE.ADBE Ultra Key',
+                    'Ultra Key',
+                    'Chave ultra',
+                    'Chave Ultra',
+                )
+                for name in effect_names:
                     try:
                         clip.addVideoEffect(name)
                         added = True
+                        print(f"[ultrakey] adicionado com nome: {name}")
                         break
                     except Exception:
                         continue
 
-                # procura de novo com polling (o Premiere às vezes demora para refletir)
+                # fallback: tenta via QE (aceita matchName direto)
+                if not added:
+                    try:
+                        qe_seq = pymiere.objects.qe.project.getActiveSequence()
+                        # busca o clip no QE pela posicao
+                        qe_track = qe_seq.getVideoTrackAt(
+                            getattr(clip, '_track_index', 0) if hasattr(clip, '_track_index') else 0)
+                        if qe_track:
+                            for ci in range(qe_track.numItems):
+                                qe_clip = qe_track.getItemAt(ci)
+                                if qe_clip and hasattr(qe_clip, 'addVideoEffect'):
+                                    try:
+                                        qe_clip.addVideoEffect(
+                                            pymiere.objects.qe.project.getVideoEffectByName('Ultra Key'))
+                                        added = True
+                                        print("[ultrakey] adicionado via QE")
+                                        break
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+
+                # procura de novo com polling
                 if added:
-                    for _ in range(20):  # ~ 20 * 50ms = ~1s
+                    for _ in range(30):
                         self.__throttle()
                         time.sleep(0.05)
                         for comp in clip.components:
@@ -983,7 +1053,13 @@ class PremiereManager():
                             break
 
             if uk is None:
-                print("[ultrakey] não foi possível adicionar/encontrar o Ultra Key.")
+                # Lista todos os efeitos do clip para debug
+                try:
+                    comp_names = [getattr(c, 'displayName', '?') for c in clip.components]
+                    print(f"[ultrakey] componentes do clip: {comp_names}")
+                except Exception:
+                    pass
+                print("[ultrakey] nao foi possivel adicionar/encontrar o Ultra Key.")
                 return False
 
             # 3) define a cor-chave
@@ -1117,18 +1193,82 @@ class PremiereManager():
         # logo com alpha geralmente é Normal 100%
         return self.__parse_layer_cfg(roteiro_name, 'logo.txt', 100.0, '22')
 
-    def __insert_overlay_full(self, *, roteiro_name: str, seq_end_time, paths_map: dict, project_item_cache: dict):
-        """Insere overlay.mp4 diretamente na timeline (sem FFmpeg), repetindo até cobrir toda a sequência, SEM BARRAS PRETAS."""
-        base_dir = os.path.join(self.CWD, 'partes', roteiro_name)
-        overlay_abs = os.path.join(base_dir, 'overlay.mp4')
+    def __get_video_duration_s(self, video_path: str) -> float:
+        """Retorna a duracao do video em segundos via ffprobe. Retorna 0.0 se falhar."""
+        try:
+            ffprobe = self.__get_ffprobe_bin()
+            cmd = [ffprobe, '-v', 'error', '-show_entries', 'format=duration',
+                   '-of', 'json', video_path]
+            proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=_FFMPEG_CREATE_FLAGS)
+            data = json.loads(proc.stdout or '{}')
+            return float(data.get('format', {}).get('duration', 0))
+        except Exception:
+            return 0.0
+
+    def __extend_video_ffmpeg(self, video_path: str, target_duration_s: float = 600.0) -> str:
+        """Estende um video curto via FFmpeg (stream_loop) para target_duration_s. Retorna path do video estendido."""
+        try:
+            # Se o video original ja tem duracao >= 9min, nao precisa estender
+            original_dur = self.__get_video_duration_s(video_path)
+            if original_dur >= (target_duration_s * 0.9):
+                print(f"[overlay] video original ja tem {original_dur:.0f}s (>= {target_duration_s * 0.9:.0f}s), pulando extend")
+                return video_path
+
+            out_dir = os.path.dirname(video_path)
+            base_name = os.path.splitext(os.path.basename(video_path))[0]
+            out_path = os.path.join(out_dir, f'{base_name}_10m.mp4')
+
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                print(f"[overlay] cache encontrado: {out_path}")
+                return out_path
+
+            ffmpeg = self.__get_ffmpeg_bin()
+            cmd = [
+                ffmpeg, '-y',
+                '-stream_loop', '-1',
+                '-i', video_path,
+                '-t', f'{target_duration_s:.3f}',
+                '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                '-preset', 'medium', '-crf', '18',
+                '-movflags', '+faststart',
+                '-an',
+                out_path
+            ]
+            print(f"[overlay] ffmpeg extend -> {out_path}")
+            proc = subprocess.run(cmd, check=False, capture_output=True, text=True, creationflags=_FFMPEG_CREATE_FLAGS)
+            if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                return out_path
+        except Exception as e:
+            print(f"[overlay] extend error: {e}")
+        return video_path
+
+    def __insert_overlay_full(self, *, roteiro_name: str, seq_end_time, paths_map: dict, project_item_cache: dict, overlay_path_override: str = '', prerendered_overlay_path: str = ''):
+        """Insere overlay na timeline, repetindo ate cobrir toda a sequencia."""
+        if overlay_path_override and os.path.exists(overlay_path_override):
+            overlay_abs = overlay_path_override
+        else:
+            base_dir = os.path.join(self.CWD, 'partes', roteiro_name)
+            overlay_abs = os.path.join(base_dir, 'overlay.mp4')
         if not os.path.exists(overlay_abs):
-            print("[overlay] arquivo não encontrado")
+            print("[overlay] arquivo nao encontrado:", overlay_abs)
             return
 
         total_end_s = float(getattr(seq_end_time, "seconds", 0.0))
         if total_end_s <= 0.001:
             return
-        overlay_src = paths_map.get(overlay_abs, overlay_abs)
+
+        # Usa video pre-renderizado de 10min se disponivel (menos insercoes na timeline)
+        if prerendered_overlay_path and os.path.exists(prerendered_overlay_path):
+            overlay_src = paths_map.get(prerendered_overlay_path, prerendered_overlay_path)
+            print(f"[overlay] usando video pre-renderizado: {prerendered_overlay_path}")
+        else:
+            # Fallback: tenta estender via FFmpeg agora (bloqueante)
+            extended = self.__extend_video_ffmpeg(overlay_abs, target_duration_s=600.0)
+            if extended and extended != overlay_abs and os.path.exists(extended):
+                overlay_src = paths_map.get(extended, extended)
+                print(f"[overlay] usando video estendido (fallback): {extended}")
+            else:
+                overlay_src = paths_map.get(overlay_abs, overlay_abs)
 
         if not self.__ensure_video_track_index(self.OVERLAY_TRACK_INDEX):
             return
@@ -1152,7 +1292,7 @@ class PremiereManager():
 
         debug_done = False
 
-        # EPS maior para evitar “chiar” no fim por causa de floats
+        # EPS maior para evitar "chiar" no fim por causa de floats
         EPS = 1e-2  # 10 ms
         stuck_count = 0
 
@@ -1182,7 +1322,7 @@ class PremiereManager():
                 self.__qe_razor_with_retry(track_type='video',
                                            track_index=self.OVERLAY_TRACK_INDEX,
                                            timecode=tc)
-                # remove apenas o “restinho” pós-corte
+                # remove apenas o "restinho" pós-corte
                 vtrack.clips[-1].remove(False, True)
 
                 # 🔒 Reaplica ajustes no clipe que ficou (pós-razor)
@@ -1212,67 +1352,47 @@ class PremiereManager():
         print(
             "[overlay] inserido (sem FFmpeg, loop até cobrir a sequência e SEM BARRAS PRETAS).")
 
-    def __insert_logo_full(self, *, roteiro_name: str, seq_end_time, paths_map: dict, project_item_cache: dict, dims_cache: dict):
+    def __insert_logo_full(self, *, logo_path: str, logo_position: str, seq_end_time, paths_map: dict, project_item_cache: dict, dims_cache: dict, roteiro_name: str = '', prerendered_logo_path: str = ''):
         """
-        Logo em V1:
-        - Se houver algum VÍDEO de logo em partes/<roteiro>/ (p.ex. logo_60s.mov, logo.mov, logo.mp4), usa ele.
-        - Caso NÃO haja vídeo, e houver imagem (logo.png/jpg/...), renderiza UM vídeo de 60s (logo_60s.mov) ao lado do PNG.
-        - Insere na timeline a partir de 20s, repetindo o mesmo arquivo de 60s até cobrir o fim da sequência.
-        - Apara o excedente do último clipe.
+        Logo em V5 (LOGO_TRACK_INDEX):
+        - Renderiza um video MP4 de 60s com o logo posicionado via FFmpeg.
+        - Insere UMA VEZ e repete ate cobrir toda a sequencia.
+        - logo_position: top_left, top_right, bottom_left, bottom_right
         """
-        base_dir = os.path.join(self.CWD, 'partes', roteiro_name)
-
-        # 1) tenta localizar um VÍDEO de logo já existente na pasta
-        logo_video_abs = None
-        for fname in ("logo_60s.mp4", "logo.mp4", "logo_60s.mov", "logo.mov", "logo.mxf", "logo.webm", "logo.avi"):
-            p = os.path.join(base_dir, fname)
-            if os.path.exists(p):
-                logo_video_abs = p
-                break
-
-        # 2) se não houver vídeo, tenta imagem e renderiza logo_60s.mov
-        if not logo_video_abs:
-            logo_img_abs = None
-            for fname in ("logo.png", "logo.psd", "logo.jpg", "logo.jpeg", "logo.tga"):
-                p = os.path.join(base_dir, fname)
-                if os.path.exists(p):
-                    logo_img_abs = p
-                    break
-            if not logo_img_abs:
-                print("[logo] arquivo de logo (imagem ou vídeo) não encontrado.")
-                return
-
-            # renderiza somente se não existir vídeo de logo
-            rendered = self.__render_logo_minute_plate_mp4(
-                logo_img_abs, duration_s=60.0)
-            if rendered and os.path.exists(rendered):
-                logo_video_abs = rendered
-            else:
-                print("[logo] falha ao renderizar logo_60s.mp4.")
-                return
+        if not logo_path or not os.path.exists(logo_path):
+            print("[logo] arquivo de logo nao encontrado:", logo_path)
+            return
 
         total_end_s = float(getattr(seq_end_time, "seconds", 0.0))
-        start_s = 20.0
-        if total_end_s <= start_s + 1e-3:
+        if total_end_s <= 1e-3:
+            return
+
+        # Usa video pre-renderizado se disponivel (thread paralela ja terminou)
+        if prerendered_logo_path and os.path.exists(prerendered_logo_path):
+            logo_video = prerendered_logo_path
+            print(f"[logo] usando video pre-renderizado: {logo_video}")
+        else:
+            # Fallback: renderiza agora (bloqueante)
+            logo_video = self.__render_logo_positioned_mp4(
+                logo_path, logo_position, duration_s=600.0)
+        if not logo_video or not os.path.exists(logo_video):
+            print("[logo] falha ao renderizar logo posicionado.")
             return
 
         if not self.__ensure_video_track_index(self.LOGO_TRACK_INDEX):
             return
 
         seq = pymiere.objects.app.project.activeSequence
-        vtrack = seq.videoTracks[self.LOGO_TRACK_INDEX]
-        cur = pymiere.wrappers.time_from_seconds(start_s)
+        cur = pymiere.wrappers.time_from_seconds(0)
 
-        # importa o arquivo de 60s (ou o vídeo que já existia)
-        logo_src = paths_map.get(logo_video_abs, logo_video_abs)
+        logo_src = paths_map.get(logo_video, logo_video)
         imported = self.__get_or_import_project_item(
             logo_src, project_item_cache)
         if imported == self.PYMIERE_UNDEFINED:
-            print("[logo] não foi possível importar o vídeo do logo.")
+            print("[logo] nao foi possivel importar o logo.")
             return
 
-        # insere em loop até cobrir o fim da sequência
-        EPS = 1e-2  # 10 ms de folga para evitar “chiar” no fim
+        EPS = 1e-2
         stuck_count = 0
 
         while cur.seconds < total_end_s - EPS:
@@ -1286,47 +1406,112 @@ class PremiereManager():
             )
             self.__throttle()
 
-            vtrack = seq.videoTracks[self.LOGO_TRACK_INDEX]
-
-            # ✅ APLICA TUDO ANTES do possível corte final
             try:
-                self.__apply_logo_settings(clip, roteiro_name)
+                self.__disable_scale_to_frame_size(clip)
             except Exception:
                 pass
 
-            # Se passou do fim da sequência, corta AGORA
+            # aplica opacidade/blend se houver config
+            if roteiro_name:
+                try:
+                    opacity, blend = self.__parse_logo_cfg(roteiro_name)
+                    self.__set_opacity_and_blend(
+                        clip, opacity=opacity, blend_mode=blend)
+                except Exception:
+                    pass
+
             if clip.end.seconds > total_end_s + EPS:
                 tc_cut = pymiere.wrappers.timecode_from_seconds(
                     total_end_s, seq)
                 self.__qe_razor_with_retry(track_type='video',
                                            track_index=self.LOGO_TRACK_INDEX,
                                            timecode=tc_cut)
+                vtrack = seq.videoTracks[self.LOGO_TRACK_INDEX]
                 vtrack.clips[-1].remove(False, True)
-
-                # 🔒 Reaplica ajustes no clipe que ficou (pós-razor)
-                try:
-                    kept = vtrack.clips[-1]
-                    self.__apply_logo_settings(kept, roteiro_name)
-                except Exception:
-                    pass
-
-                cur = pymiere.wrappers.time_from_seconds(total_end_s)
                 break
 
-            # fluxo normal (sem corte): avança
             cur = clip.end
 
-            # trava anti-loop
             if (cur.seconds - prev_end) <= EPS:
                 stuck_count += 1
                 if stuck_count >= 2:
-                    print(
-                        "[logo] avanço < EPS; encerrando para evitar loop infinito.")
                     break
             else:
                 stuck_count = 0
 
-        print("[logo] inserido (loop de vídeo de 60s a partir de 20s).")
+        print(f"[logo] inserido (posicao: {logo_position}).")
+
+    def __render_logo_positioned_mp4(self, logo_path: str, position: str, duration_s: float = 600.0) -> Optional[str]:
+        """
+        Renderiza MP4 transparente (ProRes4444 ou MP4 com alpha) do logo posicionado
+        no canto escolhido sobre base transparente/preta, na resolucao da sequencia.
+        """
+        try:
+            out_dir = os.path.dirname(logo_path)
+            logo_base = os.path.splitext(os.path.basename(logo_path))[0]
+            safe_pos = position.replace(' ', '_')
+            out_path = os.path.join(out_dir, f'{logo_base}_10m_{safe_pos}_{self.FRAME_W}x{self.FRAME_H}.mp4')
+
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                print(f"[logo] cache encontrado: {out_path}")
+                return out_path
+
+            ffmpeg = self.__get_ffmpeg_bin()
+            ext = os.path.splitext(logo_path)[1].lower()
+            is_image = ext in EXTENSIONS['IMAGE']
+
+            if is_image:
+                src_args = ['-loop', '1', '-t', f'{duration_s:.3f}', '-i', logo_path]
+            else:
+                src_args = ['-stream_loop', '-1', '-i', logo_path, '-t', f'{duration_s:.3f}']
+
+            size = f"{self.FRAME_W}x{self.FRAME_H}"
+            base = ['-f', 'lavfi', '-t', f'{duration_s:.3f}', '-i', f'color=c=black:s={size}']
+
+            margin = int(self.LOGO_MARGIN_PX)
+            scale_pct = float(getattr(self, 'LOGO_FIXED_SCALE_PERCENT', 12.0)) / 100.0
+
+            # Escala proporcional à resolução da sequência (não ao tamanho original do logo)
+            target_h = int(self.FRAME_H * scale_pct)
+
+            # Calcula posicao do overlay no FFmpeg
+            pos_map = {
+                'top_left': f'x={margin}:y={margin}',
+                'top_right': f'x=main_w-overlay_w-{margin}:y={margin}',
+                'bottom_left': f'x={margin}:y=main_h-overlay_h-{margin}',
+                'bottom_right': f'x=main_w-overlay_w-{margin}:y=main_h-overlay_h-{margin}',
+            }
+            pos_expr = pos_map.get(position, pos_map['bottom_right'])
+
+            fc = (
+                f"[0:v]scale=-1:{target_h}:flags=bicubic,format=rgba[lg];"
+                f"[1:v][lg]overlay={pos_expr}:format=auto"
+            )
+
+            fps = self.__get_active_sequence_fps_or(25)
+
+            cmd = [
+                ffmpeg, '-y',
+                *src_args,
+                *base,
+                '-filter_complex', fc,
+                '-r', str(fps),
+                '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                '-preset', 'medium', '-crf', '18',
+                '-movflags', '+faststart',
+                '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709',
+                '-an',
+                out_path
+            ]
+            print(f"[logo] ffmpeg render ({position}, {fps}fps) -> {out_path}")
+            proc = subprocess.run(cmd, check=False, capture_output=True, text=True, creationflags=_FFMPEG_CREATE_FLAGS)
+            self.__write_ffmpeg_debug(out_dir, cmd, proc, f'logo_60s_{safe_pos}')
+            if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                return out_path
+        except Exception as e:
+            print(f"[logo] render error: {e}")
+
+        return None
 
     def __apply_logo_settings(self, clip, roteiro_name: str):
         """Aplica neutralização de Scale-to-Frame e Opacidade/Blend no clipe do logo."""
@@ -1367,12 +1552,21 @@ class PremiereManager():
         from .premiere import editing
         return editing.save_project(self)
 
+    def __get_ffprobe_bin(self) -> str:
+        """Retorna path do ffprobe (mesmo diretorio do ffmpeg)."""
+        ffmpeg = self.__get_ffmpeg_bin()
+        ffprobe = os.path.join(os.path.dirname(ffmpeg), 'ffprobe')
+        if os.path.exists(ffprobe) or os.path.exists(ffprobe + '.exe'):
+            return ffprobe
+        return 'ffprobe'  # fallback para PATH
+
     def __get_scene_dimensions(self, scene_path: str) -> Dimensions:
         try:
-            cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            ffprobe = self.__get_ffprobe_bin()
+            cmd = [ffprobe, '-v', 'error', '-select_streams', 'v:0',
                    '-show_entries', 'stream=width,height', '-of', 'json', scene_path]
             proc = subprocess.run(cmd, capture_output=True,
-                                  encoding='utf-8', text=True)
+                                  encoding='utf-8', text=True, creationflags=_FFMPEG_CREATE_FLAGS)
             data = json.loads(proc.stdout or '{}')
             streams = data.get('streams') or []
             if streams and 'width' in streams[0] and 'height' in streams[0]:
@@ -1519,11 +1713,11 @@ class PremiereManager():
             except Exception as e:
                 print(f"[prefetch] importFiles em lote falhou (parcial ok): {e}")
 
-            # --- passo 2: polling único até todos indexados (timeout 20s) ---
+            # --- passo 2: polling unico ate todos indexados (timeout 20s) ---
             remaining = set(paths_to_import)
             deadline = time.time() + 20.0
             while remaining and time.time() < deadline:
-                self.__throttle()
+                time.sleep(0.05)  # sleep fixo leve, sem throttle IPC
                 for p in list(remaining):
                     try:
                         items = pymiere.objects.app.project.rootItem \
@@ -1555,43 +1749,55 @@ class PremiereManager():
     def __get_or_import_project_item(self, media_path: str, cache: dict):
         """
         Garante que o arquivo esteja importado no projeto e retorna o ProjectItem.
-        Faz importFiles + polling de até ~5s para a indexação do Premiere.
+        Faz importFiles + polling de ate ~5s para a indexacao do Premiere.
+        Tenta com path original e normalizado (barras) para compatibilidade.
         """
         # Tenta pegar do cache
         item = cache.get(media_path)
         if item is not None and item != self.PYMIERE_UNDEFINED:
             return item
 
-        # Tenta encontrar já importado
-        try:
-            item = pymiere.objects.app.project.rootItem.findItemsMatchingMediaPath(
-                media_path, ignoreSubclips=False)[0]
-        except Exception:
-            item = self.PYMIERE_UNDEFINED
+        # Paths alternativos para busca (Windows: / vs \)
+        norm_path = os.path.normpath(media_path)
+        fwd_path = media_path.replace('\\', '/')
+        search_paths = list(dict.fromkeys([media_path, norm_path, fwd_path]))
 
-        if item != self.PYMIERE_UNDEFINED:
-            cache[media_path] = item
-            return item
+        # Tenta encontrar ja importado
+        for sp in search_paths:
+            try:
+                item = pymiere.objects.app.project.rootItem.findItemsMatchingMediaPath(
+                    sp, ignoreSubclips=False)[0]
+            except Exception:
+                item = self.PYMIERE_UNDEFINED
+            if item != self.PYMIERE_UNDEFINED:
+                cache[media_path] = item
+                return item
 
-        # Importa e aguarda indexação
+        # Importa e aguarda indexacao
         try:
             pymiere.objects.app.project.importFiles(
-                [media_path], True, pymiere.objects.app.project.getInsertionBin(), False)
+                [norm_path], True, pymiere.objects.app.project.getInsertionBin(), False)
         except Exception:
             pass
 
         start_wait = time.time()
         item = self.PYMIERE_UNDEFINED
-        while time.time() - start_wait < 5.0:
+        while time.time() - start_wait < 8.0:
             self.__throttle()
-            try:
-                item = pymiere.objects.app.project.rootItem.findItemsMatchingMediaPath(
-                    media_path, ignoreSubclips=False)[0]
-            except Exception:
-                item = self.PYMIERE_UNDEFINED
+            for sp in search_paths:
+                try:
+                    item = pymiere.objects.app.project.rootItem.findItemsMatchingMediaPath(
+                        sp, ignoreSubclips=False)[0]
+                except Exception:
+                    item = self.PYMIERE_UNDEFINED
+                if item != self.PYMIERE_UNDEFINED:
+                    break
             if item != self.PYMIERE_UNDEFINED:
                 break
-            time.sleep(0.1)
+            time.sleep(0.2)
+
+        if item == self.PYMIERE_UNDEFINED:
+            print(f"[import] FALHA ao encontrar no projeto: {media_path}")
 
         cache[media_path] = item
         return item
@@ -1795,6 +2001,109 @@ class PremiereManager():
             return default
 
     # ====== CARTELA: helpers FFmpeg ======
+    def __chromakey_to_alpha(self, video_path: str, key_color_hex: str = "#00FF00",
+                              similarity: float = 0.3, blend: float = 0.1) -> str:
+        """
+        Converte video com fundo chroma key para MOV ProRes 4444 com canal alfa real.
+        Retorna o path do arquivo convertido, ou o original se falhar.
+        """
+        try:
+            out_dir = os.path.dirname(video_path)
+            base_name = os.path.splitext(os.path.basename(video_path))[0]
+            out_path = os.path.join(out_dir, f'{base_name}_alpha.mov')
+
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                return out_path
+
+            ffmpeg = self.__get_ffmpeg_bin()
+
+            # Converte hex para formato FFmpeg (0xRRGGBB)
+            color = key_color_hex.replace('#', '0x')
+
+            cmd = [
+                ffmpeg, '-y',
+                '-i', video_path,
+                '-vf', f'chromakey={color}:{similarity}:{blend}',
+                '-c:v', 'prores_ks',
+                '-profile:v', '4444',
+                '-pix_fmt', 'yuva444p10le',
+                '-c:a', 'pcm_s16le',
+                out_path
+            ]
+            print(f"[cta] ffmpeg chromakey -> {out_path}")
+            proc = subprocess.run(cmd, check=False, capture_output=True, text=True, creationflags=_FFMPEG_CREATE_FLAGS)
+            if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                print(f"[cta] chromakey convertido com sucesso")
+                return out_path
+            else:
+                print(f"[cta] ffmpeg chromakey falhou (code {proc.returncode})")
+                if proc.stderr:
+                    print(f"[cta] stderr: {proc.stderr[-300:]}")
+        except Exception as e:
+            print(f"[cta] chromakey erro: {e}")
+
+        return video_path
+
+    @staticmethod
+    def __db_to_linear(db: float) -> float:
+        """Converte dB para ganho linear na escala do Premiere.
+        Premiere usa escala onde 1.0 linear = +15 dB na UI.
+        Portanto: 0 dB UI = 10^(-15/20) ~= 0.1778, -12 dB UI = 10^(-27/20), etc."""
+        if db <= -96:
+            return 0.0
+        return 10.0 ** ((db - 15.0) / 20.0)
+
+    def __set_audio_track_volume_db(self, track_index: int, db: float):
+        """Define o volume (em dB) de todos os clips de uma trilha de audio.
+        Converte dB para ganho linear antes de aplicar."""
+        linear = self.__db_to_linear(db)
+        try:
+            seq = pymiere.objects.app.project.activeSequence
+            atrack = seq.audioTracks[track_index]
+
+            # Garantir que a trilha NAO esteja mutada
+            try:
+                atrack.setMute(0)
+            except Exception:
+                pass
+
+            clips = list(atrack.clips)
+            if not clips:
+                print(f"[mixer] A{track_index + 1}: nenhum clip encontrado")
+                return
+
+            applied = 0
+            for ci, clip in enumerate(clips):
+                try:
+                    found = False
+                    for comp in clip.components:
+                        dn = (getattr(comp, 'displayName', '') or '').lower()
+                        if 'volume' not in dn:
+                            continue
+                        # Pegar somente o componente "Volume", nao "Volume do canal"
+                        if 'canal' in dn or 'channel' in dn:
+                            continue
+
+                        for prop in comp.properties:
+                            pn = (getattr(prop, 'displayName', '') or '').lower()
+                            pn_clean = pn.replace('\u00ed', 'i').replace('\u00e1', 'a').replace('\u00e9', 'e')
+                            if 'level' in pn_clean or 'nivel' in pn_clean or 'db' in pn_clean or pn_clean == 'volume':
+                                try:
+                                    prop.setValue(linear, True)
+                                    applied += 1
+                                    found = True
+                                except Exception as e_set:
+                                    print(f"[mixer] A{track_index + 1} clip{ci} setValue falhou: {e_set}")
+                                break
+                        if found:
+                            break
+                except Exception as e_clip:
+                    print(f"[mixer] A{track_index + 1} clip{ci} erro: {e_clip}")
+
+            print(f"[mixer] A{track_index + 1} = {db} dB (linear={linear:.6f}) (aplicado em {applied}/{len(clips)} clips)")
+        except Exception as e:
+            print(f"[mixer] erro ao definir volume A{track_index + 1}: {e}")
+
     def __get_ffmpeg_bin(self) -> str:
         """
         Retorna o caminho do binário do FFmpeg. Tenta:
@@ -1963,7 +2272,7 @@ class PremiereManager():
             ]
             try:
                 proc = subprocess.run(
-                    cmd, check=False, capture_output=True, text=True)
+                    cmd, check=False, capture_output=True, text=True, creationflags=_FFMPEG_CREATE_FLAGS)
                 # >>> logs agora vão para txt_dir (assets/titlecards/…)
                 self.__write_ffmpeg_debug(
                     txt_dir, cmd, proc, f'try{idx_try}_{codec}')
@@ -1978,6 +2287,32 @@ class PremiereManager():
         return None
 
     # ====== CARTELA: garante trilha de vídeo V2 (para o texto) ======
+
+    def __ensure_audio_track_index(self, idx: int):
+        """Garante que o indice de trilha de audio 'idx' exista."""
+        try:
+            _ = pymiere.objects.app.project.activeSequence.audioTracks[idx]
+            return True
+        except Exception:
+            pass
+        try:
+            qe_seq = pymiere.objects.qe.project.getActiveSequence()
+            for _ in range(8):
+                try:
+                    qe_seq.addTracks(0, 1)  # 0 video, 1 audio
+                except Exception:
+                    try:
+                        qe_seq.addTracks()
+                    except Exception:
+                        pass
+                try:
+                    _ = pymiere.objects.app.project.activeSequence.audioTracks[idx]
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
 
     def __ensure_video_track_index(self, idx: int):
         """
@@ -2037,7 +2372,7 @@ class PremiereManager():
 
     def __animate_opacity_fade_out(self, clip, fade_seconds: float = 0.5):
         """
-        Adiciona keyframes de Opacidade para “desaparecer” no final do clipe.
+        Adiciona keyframes de Opacidade para "desaparecer" no final do clipe.
         """
         try:
             end_s = clip.outPoint.seconds
@@ -2065,7 +2400,7 @@ class PremiereManager():
 
     def __animate_opacity_fade_in(self, clip, fade_seconds: float = 0.5) -> bool:
         """
-        Adiciona keyframes de Opacidade para “aparecer” no início do clipe.
+        Adiciona keyframes de Opacidade para "aparecer" no início do clipe.
         0% no inPoint → 100% em fade_seconds.
         """
         try:

@@ -1,0 +1,80 @@
+================================================================
+  AUTOMATIZADOR DO PREMIERE - NOTAS DE ATUALIZAÇÃO
+================================================================
+
+────────────────────────────────────────────────────────────────
+  VERSÃO 2.0 (04/04/2026)
+────────────────────────────────────────────────────────────────
+
+NOVIDADES:
+
+  Editor de Estilos para Frases Impactantes
+  - Personalize cor da fonte, cor da borda, largura, sombra
+  - Animações: Fade e Pop com duração configurável (%)
+  - CAPS LOCK, posição (Topo/Centro/Baixo), tamanho da fonte
+  - Preview em tempo real e Preview 1080p
+  - Salve e carregue estilos personalizados
+
+  Frases Impactantes com Canal Alpha
+  - Vídeos renderizados com transparência real (sem modo Tela)
+  - Frases completas até o ponto final (sem cortar no meio)
+  - Modo Frase e modo Palavra por palavra
+
+  Cache de Frases
+  - Opção "Usar cache" para reutilizar frases sem chamar a IA
+  - Economiza tempo e custo de API nas re-execuções
+
+  Mixer de Áudio Completo
+  - Controle de volume para Cenas (A1), Narração (A2),
+    Inscreva-se (A3) e Música (A5)
+  - Valores em dB aplicados corretamente no Premiere
+
+  Renomeador de Cenas Avançado
+  - Palavras no nome: controle quantas palavras no arquivo
+  - Frases por item: agrupe frases do roteiro
+  - Repetições: permita a mesma cena em várias frases
+  - Reprocessar Pendências: tente novamente frases sem cena
+  - Desfazer Última: reverta a cópia de arquivos
+  - Auto-seleção da próxima frase sem cena
+  - Carregamento progressivo (sem travamento)
+  - Thumbnails em 16:9
+
+MELHORIAS DE PERFORMANCE:
+
+  - Frases renderizadas em paralelo com a montagem de cenas
+  - Overlay e Logo com cache inteligente (não re-renderiza)
+  - Importação única de arquivos (sem duplicação)
+  - Logo proporcional à resolução da sequência
+
+MELHORIAS DE INTERFACE:
+
+  - Auto-verificação do Premiere ao abrir (pula tela inicial)
+  - Botão Renomear Cenas disponível na tela inicial
+  - Tooltips (?) explicativos em todos os controles
+  - Indicadores de renderização (Verde/Vermelho) no Logo e Overlay
+  - Log completo de configurações ao exportar
+  - Console sem janelas piscando (FFmpeg silencioso)
+
+CORREÇÕES:
+
+  - Volume -999 no Premiere corrigido (conversão dB para linear)
+  - Navegação Configurações voltava para tela errada
+  - Sequência não criada mostrava erro genérico
+  - Frases impactantes travavam com segmentos gigantes
+
+────────────────────────────────────────────────────────────────
+  VERSÃO 1.0 (03/04/2026)
+────────────────────────────────────────────────────────────────
+
+  - Versão inicial do Automatizador do Premiere
+  - Montagem automática de timeline (narração + cenas + música)
+  - Transcrição com AssemblyAI
+  - Casamento semântico cena/fala via OpenAI
+  - Zoom e Fade automáticos
+  - Overlay e Logo com renderização FFmpeg
+  - CTA Inscreva-se com Chroma Key
+  - Frases Impactantes (GPT + FFmpeg)
+  - Renomeador de Cenas integrado (Gemini + embeddings)
+  - Modo vídeo em massa (backend)
+
+================================================================

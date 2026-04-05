@@ -14,6 +14,67 @@ from ..components import SelectComponent
 from ...managers import ConversionManager, DirectoriesManager, PremiereManager, SettingsManager, TranscriptionManager
 
 
+class _Tip:
+    """Tooltip ao passar o mouse."""
+    def __init__(self, widget, text: str):
+        self.widget = widget
+        self.text = text
+        self._tw = None
+        widget.bind("<Enter>", self._show)
+        widget.bind("<Leave>", self._hide)
+
+    def _show(self, _e=None):
+        if self._tw:
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 5
+        self._tw = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tk.Label(tw, text=self.text, justify="left",
+                 bg="#ffffe0", fg="#333", relief="solid", borderwidth=1,
+                 font=("Arial", 9), padx=6, pady=4).pack()
+
+    def _hide(self, _e=None):
+        if self._tw:
+            self._tw.destroy()
+            self._tw = None
+
+
+def _tip_label(parent, tip_text: str):
+    """Cria um label (?) com tooltip e retorna o label."""
+    lbl = tk.Label(parent, text="(?)", fg="#0078D7", cursor="hand2", font=("Arial", 8, "bold"))
+    _Tip(lbl, tip_text)
+    return lbl
+
+
+def _show_release_notes(parent):
+    """Abre janela com notas de atualização."""
+    notes_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
+        "assets", "release_notes.txt"
+    )
+    try:
+        with open(notes_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        content = "Arquivo de notas não encontrado."
+
+    win = tk.Toplevel(parent)
+    win.title("Notas de Atualização")
+    win.geometry("620x500")
+
+    text = tk.Text(win, wrap="word", bg="#1e1e1e", fg="#d4d4d4",
+                   font=("Consolas", 10), padx=12, pady=12)
+    sb = tk.Scrollbar(win, orient="vertical", command=text.yview)
+    text.configure(yscrollcommand=sb.set)
+    sb.pack(side="right", fill="y")
+    text.pack(fill="both", expand=True)
+
+    text.insert("1.0", content)
+    text.configure(state="disabled")
+
+
 class MainScreen:
     conversion_manager = ConversionManager()
     directories_manager = DirectoriesManager()
@@ -55,165 +116,109 @@ class MainScreen:
         API_KEY = (settings.get('env') or {}).get('ASSEMBLY_AI_KEY')
         self.transcription_manager = TranscriptionManager(API_KEY)
 
-        # --- MODO DE PROCESSAMENTO (TOPO + HORIZONTAL) ---
-        mode_row = tk.Frame(self.widget)
-        tk.Label(mode_row, text='Selecione o modo').pack(
-            side='left', padx=(0, 8))
-
-        # 'transcription' | 'mass'
+        # ========== MENU SUPERIOR ==========
         self.mode_var = tk.StringVar(value='transcription')
+        menubar = tk.Menu(app)
+        menu_opcoes = tk.Menu(menubar, tearoff=0)
+        menu_opcoes.add_command(label='Configuracoes', command=lambda: self.on_open_settings())
+        menu_opcoes.add_separator()
 
-        tk.Radiobutton(
-            mode_row, text='Vídeo com transcrição',
-            variable=self.mode_var, value='transcription',
-            command=self.__on_mode_change
-        ).pack(side='left', padx=6)
+        def _show_terminal():
+            if hasattr(self, '_terminal_popup') and self._terminal_popup:
+                self._terminal_popup.show()
 
-        # tk.Radiobutton(
-        #     mode_row, text='Vídeo em massa',
-        #     variable=self.mode_var, value='mass',
-        #     command=self.__on_mode_change
-        # ).pack(side='left', padx=6)
+        menu_opcoes.add_command(label='Terminal', command=_show_terminal)
+        menubar.add_cascade(label='Opcoes', menu=menu_opcoes)
 
-        mode_row.pack(anchor='n', pady=(6, 8))
+        # Menu Ajuda
+        menu_ajuda = tk.Menu(menubar, tearoff=0)
+        menu_ajuda.add_command(label='Notas de Atualização', command=lambda: _show_release_notes(app))
+        menu_ajuda.add_command(label='Sobre', command=lambda: messagebox.showinfo(
+            'Sobre', 'Automatizador do Premiere 2.0\nDesenvolvido por Kolaias', parent=app))
+        menubar.add_cascade(label='Ajuda', menu=menu_ajuda)
 
-        header_buttons_frame = tk.Frame(self.widget)
+        app.config(menu=menubar)
 
-        open_settings_button = tk.Button(
-            header_buttons_frame, text='Configurações')
-        self.refresh_options_button = tk.Button(
-            header_buttons_frame, text='Recarregar opções')
-        self.export_project_button = tk.Button(
-            header_buttons_frame, text='Exportar projeto')
-        self.export_xml_button = tk.Button(self.widget, text='Exportar XML')
+        # Parent direto para conteudo do editor
+        ep = self.widget
 
-        header_buttons_frame.pack(anchor='center', pady=8)
+        # ========== SELECTS HORIZONTAIS (roteiro | musica | resolucao) ==========
+        selects_frame = tk.Frame(ep)
+        selects_frame.pack(fill='x', padx=12, pady=(8, 4))
 
-        def open_settings():
-            self.on_open_settings()
+        self.script_select = SelectComponent(selects_frame, 'Roteiro:', horizontal=True)
+        self.music_select = SelectComponent(selects_frame, 'Musica:', horizontal=True)
+        self.resolution_select = SelectComponent(selects_frame, 'Resolucao:', horizontal=True)
 
-        open_settings_button.configure(command=open_settings)
-        open_settings_button.pack(side='left', padx=4)
+        self.script_select.widget.pack(side='left', fill='x', expand=True, padx=(0, 8))
+        self.music_select.widget.pack(side='left', fill='x', expand=True, padx=(0, 8))
+        self.resolution_select.widget.pack(side='left', fill='x', expand=True)
 
-        # -------- SELECTS (roteiro / música / resolução) --------
-        # (fica em um bloco próprio pra nunca "sumir")
-        selects_frame = tk.Frame(self.widget)
-        selects_frame.pack(anchor='center', pady=(0, 8))
-
-        self.script_select = SelectComponent(
-            selects_frame, 'Selecione o roteiro')
-        self.music_select = SelectComponent(
-            selects_frame, 'Selecione o estilo das músicas')
-        self.resolution_select = SelectComponent(
-            selects_frame, 'Proporção do vídeo (Largura x Altura)')
-
-        self.script_select.render()
-        self.music_select.render()
-        self.resolution_select.render()
-
-        # resolução (fixo)
-        res_opts = ['1920 x 1080', '1536 x 768 (não funcionando)']
+        res_opts = ['1920 x 1080', '1536 x 768']
         cached_res = (ui_cache.get("resolution") or "").strip()
         self.resolution_select.set_options(res_opts, selected=cached_res)
 
+        # Botao recarregar (inline)
+        self.refresh_options_button = tk.Button(selects_frame, text='Recarregar', font=('Arial', 8))
+
         def load_options():
             options = self.directories_manager.read_directories() or {}
-
             scripts = list(options.get("narracao") or [])
             musics = list(options.get("musica") or [])
-
             cached_script = (ui_cache.get("script_name") or "").strip()
             cached_music = (ui_cache.get("music_style") or "").strip()
-
             self.script_select.set_options(scripts, selected=cached_script)
             self.music_select.set_options(musics, selected=cached_music)
+            # atualiza listas de pastas (logo, overlay, animacao)
+            for _refresh in [self.__refresh_logo_list, self.__refresh_overlay_list, self.__refresh_cta_list]:
+                if hasattr(self, 'logo_menu'):
+                    try:
+                        _refresh()
+                    except Exception:
+                        pass
 
         self.refresh_options_button.configure(command=load_options)
-        self.refresh_options_button.pack(side='left', padx=4)
-
-        self.export_project_button.pack(side='left', padx=4)
-        open_settings_button.pack(side='left', padx=4)
-
-        # -------- Botão Renomeador de Cenas --------
-        def _open_renamer():
-            from ..screens.RenamerFeedbackScreen import RenamerFeedbackScreen
-            RenamerFeedbackScreen(app, self.settings_manager)
-
-        tk.Button(
-            header_buttons_frame,
-            text='🎬 Renomear Cenas',
-            bg='#5C2D91',
-            fg='white',
-            font=('Arial', 9, 'bold'),
-            command=_open_renamer,
-        ).pack(side='left', padx=4)
+        self.refresh_options_button.pack(side='left', padx=(8, 0))
 
         load_options()
 
-        # -------- Zoom / Fade --------
+        # ========== ZOOM / FADE / OPCOES (linha horizontal) ==========
         def validate_percentage(value: str) -> bool:
             try:
                 if value == '':
                     return True
-                percentage = int(value)
-                return percentage >= 1
+                return int(value) >= 1
             except:
                 return False
 
-        percentage_validate_command = (
-            self.widget.register(validate_percentage), '%P')
+        percentage_validate_command = (self.widget.register(validate_percentage), '%P')
 
-        min_zoom_frame = tk.Frame(self.widget)
-        min_zoom_label = tk.Label(min_zoom_frame, text='Zoom inicial (%):')
-        self.min_zoom_entry = tk.Entry(
-            min_zoom_frame, width=5, validate='key', validatecommand=percentage_validate_command)
+        params_row = tk.Frame(ep)
 
-        max_zoom_frame = tk.Frame(self.widget)
-        max_zoom_label = tk.Label(max_zoom_frame, text='Zoom final (%):')
-        self.max_zoom_entry = tk.Entry(
-            max_zoom_frame, width=5, validate='key', validatecommand=percentage_validate_command)
-
-        min_zoom_frame.pack(anchor='center')
-        max_zoom_frame.pack(anchor='center')
-
+        tk.Label(params_row, text='Zoom:').pack(side='left', padx=(0, 2))
+        self.min_zoom_entry = tk.Entry(params_row, width=4, validate='key', validatecommand=percentage_validate_command)
         self.min_zoom_entry.insert(0, '100')
+        self.min_zoom_entry.pack(side='left')
+        tk.Label(params_row, text='~').pack(side='left')
+        self.max_zoom_entry = tk.Entry(params_row, width=4, validate='key', validatecommand=percentage_validate_command)
         self.max_zoom_entry.insert(0, '110')
+        self.max_zoom_entry.pack(side='left')
+        tk.Label(params_row, text='%').pack(side='left', padx=(0, 12))
 
-        min_zoom_label.pack(side='left')
-        self.min_zoom_entry.pack()
-
-        max_zoom_label.pack(side='left')
-        self.max_zoom_entry.pack()
-
-        fade_frame = tk.Frame(self.widget)
-        fade_label = tk.Label(fade_frame, text='Transição (fade) %:')
-        self.fade_entry = tk.Entry(
-            fade_frame, width=5, validate='key', validatecommand=percentage_validate_command)
-
-        fade_frame.pack(anchor='center')
-        fade_label.pack(side='left')
-        self.fade_entry.pack()
+        tk.Label(params_row, text='Fade:').pack(side='left', padx=(0, 2))
+        self.fade_entry = tk.Entry(params_row, width=4, validate='key', validatecommand=percentage_validate_command)
         self.fade_entry.insert(0, '10')
+        self.fade_entry.pack(side='left')
+        tk.Label(params_row, text='%').pack(side='left', padx=(0, 12))
 
-        # duplicar / preencher gaps
         self.dup_scenes_var = tk.IntVar(value=1)
-        tk.Checkbutton(
-            self.widget,
-            text='Duplicar cenas até a próxima (preencher sem buracos)',
-            variable=self.dup_scenes_var
-        ).pack(anchor='center', pady=(4, 0))
+        tk.Checkbutton(params_row, text='Duplicar cenas', variable=self.dup_scenes_var).pack(side='left', padx=(0, 0))
+        _tip_label(params_row, "Repete a cena até a próxima marca\nda narração, preenchendo o tempo.").pack(side='left', padx=(0, 6))
 
         self.fill_gaps_var = tk.IntVar(value=0)
-        self.fill_gaps_cb = tk.Checkbutton(
-            self.widget,
-            text='Preencher espaço sem cena (usar cenas aleatórias)',
-            variable=self.fill_gaps_var
-        )
-        self.fill_gaps_cb.pack(anchor='center', pady=(2, 0))
-
-        # Frame de duração máxima das cenas aleatórias (visível só quando fill_gaps está ativo)
-        self.fill_gaps_dur_frame = tk.Frame(self.widget)
-        tk.Label(self.fill_gaps_dur_frame, text='Dur. máx. cena aleatória (s):').pack(side='left')
+        self.fill_gaps_cb = tk.Checkbutton(params_row, text='Preencher gaps', variable=self.fill_gaps_var)
+        self.fill_gaps_cb.pack(side='left', padx=(0, 0))
+        _tip_label(params_row, "Preenche espaços sem cena com\ncenas aleatórias do roteiro.").pack(side='left', padx=(0, 4))
 
         def _validate_fill_dur(v: str) -> bool:
             if v == '':
@@ -224,11 +229,20 @@ class MainScreen:
                 return False
 
         vcmd_fill_dur = (self.widget.register(_validate_fill_dur), '%P')
-        self.max_fill_scene_entry = tk.Entry(
-            self.fill_gaps_dur_frame, width=4, validate='key', validatecommand=vcmd_fill_dur)
+        self.fill_gaps_dur_frame = tk.Frame(params_row)
+        tk.Label(self.fill_gaps_dur_frame, text='max:').pack(side='left')
+        _tip_label(self.fill_gaps_dur_frame, "Duração máxima de cada cena aleatória\nem segundos. 0 = sem limite.").pack(side='left')
+        self.max_fill_scene_entry = tk.Entry(self.fill_gaps_dur_frame, width=3, validate='key', validatecommand=vcmd_fill_dur)
         self.max_fill_scene_entry.insert(0, '7')
-        self.max_fill_scene_entry.pack(side='left', padx=(4, 0))
+        self.max_fill_scene_entry.pack(side='left')
+        tk.Label(self.fill_gaps_dur_frame, text='s').pack(side='left')
         self.fill_gaps_dur_frame.pack_forget()
+
+        params_row.pack(anchor='center', pady=(4, 4))
+
+        # Botoes de exportar e XML (hidden)
+        self.export_project_button = tk.Button(ep, text='Exportar projeto', font=('Arial', 10, 'bold'), bg='#2d7d46', fg='white', padx=20, pady=4)
+        self.export_xml_button = tk.Button(ep, text='Exportar XML')
 
         def _sync_fill_gaps_state(*_args):
             try:
@@ -258,149 +272,139 @@ class MainScreen:
         # =========================
         # FRASES IMPACTANTES
         # =========================
-        self.impact_frame = tk.Frame(self.widget)
+        self.impact_frame = tk.LabelFrame(ep, text='Frases Impactantes (GPT)', padx=8, pady=4)
 
         self.impact_font_file_var = tk.StringVar(value='')
-
-        font_line = tk.Frame(self.impact_frame)
-        tk.Label(font_line, text="Fonte (pasta fontes):").pack(
-            side="left", padx=(0, 8))
-
         self._font_files = self.__list_font_files()
-        self._font_map = {fn: os.path.join(
-            self.__get_fontes_dir(), fn) for fn in self._font_files}
+        self._font_map = {fn: os.path.join(self.__get_fontes_dir(), fn) for fn in self._font_files}
 
-        impact_cached = ui_cache.get(
-            "impact", {}) if isinstance(ui_cache, dict) else {}
+        impact_cached = ui_cache.get("impact", {}) if isinstance(ui_cache, dict) else {}
         if not isinstance(impact_cached, dict):
             impact_cached = {}
 
         cached_choice = (impact_cached.get("font_choice") or "").strip()
-        options = ["(Automático)"] + self._font_files
-        default_opt = cached_choice if cached_choice in self._font_files else "(Automático)"
-
+        font_options = ["(Auto)"] + self._font_files
+        default_opt = cached_choice if cached_choice in self._font_files else "(Auto)"
         self.impact_font_choice_var = tk.StringVar(value=default_opt)
 
         def _on_font_choice_change(*_):
             choice = (self.impact_font_choice_var.get() or "").strip()
-            if choice in ("(Automático)", ""):
+            if choice in ("(Auto)", ""):
                 self.impact_font_file_var.set("")
             else:
                 self.impact_font_file_var.set(self._font_map.get(choice, ""))
+            # Atualizar preview inline com a nova fonte
+            try:
+                self._update_impact_inline_preview()
+            except Exception:
+                pass
 
         try:
-            self.impact_font_choice_var.trace_add(
-                "write", _on_font_choice_change)
+            self.impact_font_choice_var.trace_add("write", _on_font_choice_change)
         except Exception:
             pass
 
-        self.impact_font_menu = tk.OptionMenu(
-            font_line, self.impact_font_choice_var, *options)
-        self.impact_font_menu.pack(side="left")
-        tk.Button(font_line, text="Atualizar lista",
-                  command=self.__refresh_font_list).pack(side="left", padx=(8, 0))
-        font_line.pack(anchor="w", pady=(4, 0))
-
-        _on_font_choice_change()
-
-        self.impact_enable_var = tk.IntVar(value=0)
-        tk.Checkbutton(
-            self.impact_frame,
-            text='Ativar frases impactantes na tela (GPT)',
-            variable=self.impact_enable_var
-        ).pack(anchor='w')
-
-        mode_line = tk.Frame(self.impact_frame)
-        tk.Label(mode_line, text='Modo:').pack(side='left', padx=(0, 8))
-
-        self.impact_mode_var = tk.StringVar(value='phrase')
-        tk.Radiobutton(mode_line, text='Frase inteira',
-                       variable=self.impact_mode_var, value='phrase').pack(side='left', padx=6)
-        tk.Radiobutton(mode_line, text='Palavra por palavra',
-                       variable=self.impact_mode_var, value='word').pack(side='left', padx=6)
-        mode_line.pack(anchor='w', pady=(4, 0))
-
-        def _validate_int_ge1(v: str) -> bool:
+        def _validate_int_ge1(v):
+            return v == '' or (v.isdigit() and int(v) >= 1)
+        def _validate_float_ge0(v):
             if v == '':
                 return True
             try:
-                return int(v) >= 1
+                return float(v.replace(',', '.')) >= 0.0
             except:
                 return False
-
-        def _validate_float_ge0(v: str) -> bool:
-            if v == '':
-                return True
-            try:
-                vv = float(v.replace(',', '.'))
-                return vv >= 0.0
-            except:
-                return False
-
-        def _validate_int_ge0(v: str) -> bool:
-            if v == '':
-                return True
-            try:
-                return int(v) >= 0
-            except:
-                return False
-
         vcmd_int = (self.widget.register(_validate_int_ge1), '%P')
         vcmd_float = (self.widget.register(_validate_float_ge0), '%P')
-        vcmd_int_ge0 = (self.widget.register(_validate_int_ge0), '%P')
 
-        fontsize_line = tk.Frame(self.impact_frame)
-        tk.Label(fontsize_line, text='Tamanho da fonte (px):').pack(
-            side='left', padx=(0, 8))
-        self.impact_font_size_entry = tk.Entry(
-            fontsize_line, width=5, validate='key', validatecommand=vcmd_int_ge0)
-        self.impact_font_size_entry.insert(0, '')
-        self.impact_font_size_entry.pack(side='left')
-        tk.Label(fontsize_line, text='(vazio = automático)').pack(
-            side='left', padx=(8, 0))
-        fontsize_line.pack(anchor='w', pady=(4, 0))
-
-        pos_line = tk.Frame(self.impact_frame)
-        tk.Label(pos_line, text='Posição:').pack(side='left', padx=(0, 8))
-        self.impact_pos_var = tk.StringVar(value='bottom')
-        tk.Radiobutton(pos_line, text='Baixo', variable=self.impact_pos_var,
-                       value='bottom').pack(side='left', padx=6)
-        tk.Radiobutton(pos_line, text='Centro', variable=self.impact_pos_var,
-                       value='center').pack(side='left', padx=6)
-        tk.Radiobutton(pos_line, text='Topo', variable=self.impact_pos_var,
-                       value='top').pack(side='left', padx=6)
-        pos_line.pack(anchor='w', pady=(4, 0))
-
-        max_line = tk.Frame(self.impact_frame)
-        tk.Label(max_line, text='Máximo de frases no vídeo:').pack(
-            side='left', padx=(0, 8))
-        self.impact_max_entry = tk.Entry(
-            max_line, width=4, validate='key', validatecommand=vcmd_int)
+        # Linha 1: ativar + modo + posicao
+        ir1 = tk.Frame(self.impact_frame)
+        self.impact_enable_var = tk.IntVar(value=0)
+        tk.Checkbutton(ir1, text='Ativar', variable=self.impact_enable_var).pack(side='left', padx=(0, 6))
+        self.impact_use_cache_var = tk.IntVar(value=1 if impact_cached.get("use_cache", False) else 0)
+        tk.Checkbutton(ir1, text='Usar cache', variable=self.impact_use_cache_var).pack(side='left', padx=(0, 0))
+        _tip_label(ir1, "Reutiliza as frases selecionadas da\núltima execução (pula chamada à OpenAI).\nDesmarque para recriar a seleção.").pack(side='left', padx=(0, 8))
+        self.impact_mode_var = tk.StringVar(value='phrase')
+        tk.Label(ir1, text='Modo:').pack(side='left')
+        tk.Radiobutton(ir1, text='Frase', variable=self.impact_mode_var, value='phrase').pack(side='left', padx=3)
+        tk.Radiobutton(ir1, text='Palavra', variable=self.impact_mode_var, value='word').pack(side='left', padx=(0, 0))
+        _tip_label(ir1, "Frase: mostra a frase inteira na tela.\nPalavra: mostra uma palavra por vez.").pack(side='left', padx=(0, 8))
+        tk.Label(ir1, text='Max frases:').pack(side='left')
+        self.impact_max_entry = tk.Entry(ir1, width=3, validate='key', validatecommand=vcmd_int)
         self.impact_max_entry.insert(0, '5')
-        self.impact_max_entry.pack(side='left')
-        max_line.pack(anchor='w', pady=(4, 0))
-
-        gap_line = tk.Frame(self.impact_frame)
-        tk.Label(gap_line, text='Intervalo mínimo entre frases (s):').pack(
-            side='left', padx=(0, 8))
-        self.impact_gap_entry = tk.Entry(
-            gap_line, width=5, validate='key', validatecommand=vcmd_float)
+        self.impact_max_entry.pack(side='left', padx=(0, 0))
+        _tip_label(ir1, "Número máximo de frases/palavras\nque aparecerão no vídeo.").pack(side='left', padx=(0, 8))
+        tk.Label(ir1, text='Intervalo:').pack(side='left')
+        self.impact_gap_entry = tk.Entry(ir1, width=4, validate='key', validatecommand=vcmd_float)
         self.impact_gap_entry.insert(0, '8')
         self.impact_gap_entry.pack(side='left')
-        gap_line.pack(anchor='w', pady=(4, 0))
+        tk.Label(ir1, text='s').pack(side='left', padx=(0, 0))
+        _tip_label(ir1, "Intervalo mínimo em segundos entre\ncada frase/palavra na tela.\nÉ ajustado automaticamente se necessário.").pack(side='left', padx=(0, 8))
+        tk.Label(ir1, text='Fonte:').pack(side='left')
+        self.impact_font_menu = tk.OptionMenu(ir1, self.impact_font_choice_var, *font_options)
+        self.impact_font_menu.config(width=10)
+        self.impact_font_menu.pack(side='left')
+        ir1.pack(anchor='w', pady=(0, 2))
+        _on_font_choice_change()
 
-        tk.Label(
-            self.impact_frame,
-            text='Dica: se ligar e não tiver chave da OpenAI, vai dar erro na validação.'
-        ).pack(anchor='w', pady=(4, 0))
+        # Linha 2: Estilo + preview inline
+        ir2 = tk.Frame(self.impact_frame)
+        tk.Label(ir2, text='Estilo:').pack(side='left')
+
+        from ..dialogs.StyleEditorDialog import load_styles, get_selected_style_name
+        self._impact_style_names = list(load_styles().get("styles", {}).keys())
+        self.impact_style_var = tk.StringVar(value=get_selected_style_name())
+        self.impact_style_menu = tk.OptionMenu(ir2, self.impact_style_var, *self._impact_style_names)
+        self.impact_style_menu.config(width=16)
+        self.impact_style_menu.pack(side='left', padx=(4, 8))
+
+        def _open_style_editor():
+            from ..dialogs.StyleEditorDialog import StyleEditorDialog
+            font_file = self.impact_font_file_var.get() or ''
+            StyleEditorDialog(app, on_style_changed=self._on_style_changed_callback,
+                              font_file=font_file)
+
+        tk.Button(ir2, text='Editar Estilos', command=_open_style_editor).pack(side='left', padx=(0, 6))
+
+        def _preview_1080p_inline():
+            from ..dialogs.StyleEditorDialog import load_styles, render_preview_image, HAS_PIL, DEFAULT_STYLE
+            if not HAS_PIL:
+                return
+            style_name = (self.impact_style_var.get() or "Padrão").strip()
+            data = load_styles()
+            st = dict(DEFAULT_STYLE)
+            st.update(data.get("styles", {}).get(style_name, {}))
+            font_file = self.impact_font_file_var.get() or ''
+            img = render_preview_image(st, 1920, 1080, font_file=font_file)
+            from PIL import ImageTk
+            preview_win = tk.Toplevel(app)
+            preview_win.title(f"Preview 1080p - {style_name}")
+            scale = 0.65
+            dw, dh = int(1920 * scale), int(1080 * scale)
+            from PIL import Image
+            disp = img.resize((dw, dh), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(disp)
+            canvas = tk.Canvas(preview_win, width=dw, height=dh)
+            canvas.pack()
+            canvas.create_image(0, 0, anchor="nw", image=photo)
+            canvas._photo = photo
+
+        tk.Button(ir2, text='Preview 1080p', command=_preview_1080p_inline).pack(side='left')
+        ir2.pack(anchor='w', pady=(0, 2))
+
+        # Linha 3: Preview inline do estilo
+        self._impact_preview_canvas = tk.Canvas(self.impact_frame, width=650, height=70, bg='#1a1a1a')
+        self._impact_preview_canvas.pack(anchor='w', padx=4, pady=(0, 2))
+        self._impact_preview_photo = None
+
+        # Trace para atualizar preview ao mudar estilo
+        self.impact_style_var.trace_add('write', lambda *_: self._update_impact_inline_preview())
+        self._update_impact_inline_preview()
 
         def _sync_impact_state(*_args):
             try:
-                state = 'normal' if bool(
-                    self.impact_enable_var.get()) else 'disabled'
+                state = 'normal' if bool(self.impact_enable_var.get()) else 'disabled'
                 self.impact_max_entry.configure(state=state)
                 self.impact_gap_entry.configure(state=state)
-                self.impact_font_size_entry.configure(state=state)
             except Exception:
                 pass
 
@@ -409,11 +413,127 @@ class MainScreen:
         except Exception:
             pass
         _sync_impact_state()
+        self.impact_frame.pack(fill='x', padx=12, pady=(4, 4))
 
-        self.impact_frame.pack(anchor='center', pady=(6, 8))
+        # =========================
+        # RECURSOS VISUAIS (Logo | Overlay | CTA) - 3 colunas
+        # =========================
+        self.visual_frame = tk.LabelFrame(ep, text='Recursos Visuais', padx=8, pady=4)
+
+        # --- LOGO (pasta logo/) ---
+        col_logo = tk.Frame(self.visual_frame)
+        self._logo_files = self.__list_logo_files()
+        logo_opts = ['(Nenhum)'] + self._logo_files
+        cached_logo = (ui_cache.get("logo_file") or "").strip()
+        self.logo_choice_var = tk.StringVar(value=cached_logo if cached_logo in self._logo_files else '(Nenhum)')
+
+        tk.Label(col_logo, text='Logo (pasta logo/):').pack(anchor='w')
+        self.logo_menu = tk.OptionMenu(col_logo, self.logo_choice_var, *logo_opts)
+        self.logo_menu.config(width=16)
+        self.logo_menu.pack(anchor='w')
+
+        self.logo_status_label = tk.Label(col_logo, text='', font=('', 8))
+        self.logo_status_label.pack(anchor='w')
+
+        self.logo_pos_var = tk.StringVar(value=(ui_cache.get("logo_position") or "bottom_right").strip())
+        pos_row = tk.Frame(col_logo)
+        for t, v in [('Sup.Esq', 'top_left'), ('Sup.Dir', 'top_right'), ('Inf.Esq', 'bottom_left'), ('Inf.Dir', 'bottom_right')]:
+            tk.Radiobutton(pos_row, text=t, variable=self.logo_pos_var, value=v).pack(side='left', padx=2)
+        pos_row.pack(anchor='w', pady=(2, 0))
+        col_logo.pack(side='left', padx=(0, 16), anchor='n')
+
+        # --- OVERLAY (pasta overlay/) ---
+        col_overlay = tk.Frame(self.visual_frame)
+        self._overlay_files = self.__list_overlay_files()
+        overlay_opts = ['(Nenhum)'] + self._overlay_files
+        cached_ov = (ui_cache.get("overlay_file") or "").strip()
+        self.overlay_choice_var = tk.StringVar(value=cached_ov if cached_ov in self._overlay_files else '(Nenhum)')
+
+        tk.Label(col_overlay, text='Overlay (pasta overlay/):').pack(anchor='w')
+        self.overlay_menu = tk.OptionMenu(col_overlay, self.overlay_choice_var, *overlay_opts)
+        self.overlay_menu.config(width=16)
+        self.overlay_menu.pack(anchor='w')
+        self.overlay_status_label = tk.Label(col_overlay, text='', font=('', 8))
+        self.overlay_status_label.pack(anchor='w')
+        col_overlay.pack(side='left', padx=(0, 16), anchor='n')
+
+        # --- CTA INSCREVA-SE (pasta animacao/) ---
+        col_cta = tk.Frame(self.visual_frame)
+        self._cta_files = self.__list_cta_files()
+        cta_opts = ['(Nenhum)'] + self._cta_files
+        cached_cta = (ui_cache.get("cta_file") or "").strip()
+        self.cta_choice_var = tk.StringVar(value=cached_cta if cached_cta in self._cta_files else '(Nenhum)')
+
+        tk.Label(col_cta, text='Animacao (pasta animacao/):').pack(anchor='w')
+        self.cta_menu = tk.OptionMenu(col_cta, self.cta_choice_var, *cta_opts)
+        self.cta_menu.config(width=16)
+        self.cta_menu.pack(anchor='w')
+
+        self.cta_enable_var = tk.IntVar(value=1 if ui_cache.get("cta_enabled") else 0)
+        self.cta_chroma_var = tk.IntVar(value=1 if ui_cache.get("cta_chroma_key", True) else 0)
+        cta_opts_row = tk.Frame(col_cta)
+        tk.Checkbutton(cta_opts_row, text='Inscreva-se', variable=self.cta_enable_var).pack(side='left')
+        tk.Checkbutton(cta_opts_row, text='Chroma Key', variable=self.cta_chroma_var).pack(side='left', padx=(8, 0))
+        _tip_label(cta_opts_row, "Remove o fundo verde/azul da\nanimação do CTA (Inscreva-se)\nusando chroma key via FFmpeg.").pack(side='left')
+        cta_opts_row.pack(anchor='w', pady=(2, 0))
+        col_cta.pack(side='left', anchor='n')
+
+        self.visual_frame.pack(fill='x', padx=12, pady=(4, 4))
+
+        # Traces para atualizar indicadores de renderizacao
+        def _update_render_indicators(*_args):
+            self.__update_logo_render_status()
+            self.__update_overlay_render_status()
+
+        self.logo_choice_var.trace_add('write', _update_render_indicators)
+        self.logo_pos_var.trace_add('write', _update_render_indicators)
+        self.overlay_choice_var.trace_add('write', _update_render_indicators)
+        _update_render_indicators()
+
+        # Manter compatibilidade com overlay_path_var e cta_path_var
+        self.overlay_path_var = tk.StringVar(value='')
+        self.cta_path_var = tk.StringVar(value='')
+
+        # =========================
+        # MIXER DE AUDIO (volume por trilha em dB)
+        # =========================
+        mixer_frame = tk.LabelFrame(ep, text='Mixer de Audio (dB)', padx=8, pady=4)
+
+        def _validate_db(v):
+            if v in ('', '-'):
+                return True
+            try:
+                float(v)
+                return True
+            except:
+                return False
+
+        vcmd_db = (self.widget.register(_validate_db), '%P')
+
+        tk.Label(mixer_frame, text='Cenas (A1):').pack(side='left')
+        self.vol_scene_entry = tk.Entry(mixer_frame, width=5, validate='key', validatecommand=vcmd_db)
+        self.vol_scene_entry.insert(0, str(ui_cache.get("vol_scene", -99)))
+        self.vol_scene_entry.pack(side='left', padx=(0, 12))
+
+        tk.Label(mixer_frame, text='Narracao (A2):').pack(side='left')
+        self.vol_narration_entry = tk.Entry(mixer_frame, width=5, validate='key', validatecommand=vcmd_db)
+        self.vol_narration_entry.insert(0, str(ui_cache.get("vol_narration", 0)))
+        self.vol_narration_entry.pack(side='left', padx=(0, 12))
+
+        tk.Label(mixer_frame, text='Inscreva-se (A3):').pack(side='left')
+        self.vol_cta_entry = tk.Entry(mixer_frame, width=5, validate='key', validatecommand=vcmd_db)
+        self.vol_cta_entry.insert(0, str(ui_cache.get("vol_cta", -9)))
+        self.vol_cta_entry.pack(side='left', padx=(0, 12))
+
+        tk.Label(mixer_frame, text='Musica (A5):').pack(side='left')
+        self.vol_music_entry = tk.Entry(mixer_frame, width=5, validate='key', validatecommand=vcmd_db)
+        self.vol_music_entry.insert(0, str(ui_cache.get("vol_music", -12)))
+        self.vol_music_entry.pack(side='left')
+
+        mixer_frame.pack(fill='x', padx=12, pady=(4, 4))
 
         # --- ORDEM DAS CENAS (modo em massa) ---
-        self.order_frame = tk.Frame(self.widget)
+        self.order_frame = tk.Frame(ep)
         tk.Label(self.order_frame, text='Ordem das cenas').pack(
             side='left', padx=(0, 8))
         self.mass_order_var = tk.StringVar(value='asc')
@@ -424,7 +544,7 @@ class MainScreen:
         self.order_frame.pack_forget()
 
         # --- TAMANHO DAS CENAS (modo em massa) ---
-        self.duration_frame = tk.Frame(self.widget)
+        self.duration_frame = tk.Frame(ep)
         tk.Label(self.duration_frame, text='Tamanho das cenas (s):').pack(
             side='left', padx=(0, 8))
 
@@ -509,7 +629,7 @@ class MainScreen:
                 try:
                     choice = (self.impact_font_choice_var.get() or "").strip()
                     impact_cfg["font_choice"] = "" if choice in (
-                        "", "(Automático)") else choice
+                        "", "(Auto)") else choice
                 except Exception:
                     pass
 
@@ -537,6 +657,76 @@ class MainScreen:
                 self.selected_max_fill_scene_duration = self.get_max_fill_scene_duration()
                 self.selected_impact_config = self.get_impact_config()
 
+                # Recursos visuais
+                self.selected_logo_path = self._get_selected_logo_path()
+                self.selected_logo_position = (self.logo_pos_var.get() or 'bottom_right').strip()
+                self.selected_overlay_path = self._get_selected_overlay_path()
+                self.selected_cta_enabled = bool(self.cta_enable_var.get())
+                self.selected_cta_anim_path = self._get_selected_cta_path()
+                self.selected_cta_chroma_key = bool(self.cta_chroma_var.get())
+
+                # Mixer volumes
+                try:
+                    self.selected_vol_scene = float(self.vol_scene_entry.get() or -99)
+                except Exception:
+                    self.selected_vol_scene = -99.0
+                try:
+                    self.selected_vol_narration = float(self.vol_narration_entry.get() or 0)
+                except Exception:
+                    self.selected_vol_narration = 0.0
+                try:
+                    self.selected_vol_cta = float(self.vol_cta_entry.get() or -9)
+                except Exception:
+                    self.selected_vol_cta = -9.0
+                try:
+                    self.selected_vol_music = float(self.vol_music_entry.get() or -12)
+                except Exception:
+                    self.selected_vol_music = -12.0
+
+                # Log de todas as configurações selecionadas
+                _script = self.script_select.get_selected_option() or '?'
+                _music = self.music_select.get_selected_option() or '?'
+                _resolution = self.resolution_select.get_selected_option() or '?'
+                _impact = self.selected_impact_config or {}
+                _logo_file = os.path.basename(self.selected_logo_path) if self.selected_logo_path else '(Nenhum)'
+                _overlay_file = os.path.basename(self.selected_overlay_path) if self.selected_overlay_path else '(Nenhum)'
+                _cta_file = os.path.basename(self.selected_cta_anim_path) if self.selected_cta_anim_path else '(Nenhum)'
+
+                print("=" * 60)
+                print("  CONFIGURAÇÕES DO EXPORT")
+                print("=" * 60)
+                print(f"  Roteiro:        {_script}")
+                print(f"  Música:         {_music}")
+                print(f"  Resolução:      {_resolution}")
+                print(f"  Zoom:           {self.min_zoom_entry.get()}% ~ {self.max_zoom_entry.get()}%")
+                print(f"  Fade:           {self.selected_fade_percentage}%  (imediato: {self.selected_fade_live})")
+                print(f"  Duplicar cenas: {self.selected_duplicate_scenes}")
+                print(f"  Preencher gaps: {self.selected_fill_gaps_without_scene}  (max dur: {self.selected_max_fill_scene_duration}s)")
+                print("-" * 60)
+                print(f"  Frases Impact.: {'SIM' if _impact.get('enabled') else 'NAO'}")
+                if _impact.get('enabled'):
+                    _st = _impact.get('text_style', {})
+                    print(f"    Estilo:       {self.impact_style_var.get()}")
+                    print(f"    Modo:         {_impact.get('mode', '?')}")
+                    print(f"    Max frases:   {_impact.get('max_phrases_total', '?')}")
+                    print(f"    Intervalo:    {_impact.get('min_gap_seconds', '?')}s")
+                    print(f"    Posição:      {_st.get('position', '?')}")
+                    print(f"    Tamanho:      {_st.get('font_size', '?')}px")
+                    print(f"    Fonte:        {_impact.get('font_file', '(auto)')}")
+                    print(f"    Cor:          {_st.get('font_color', '?')} | Borda: {_st.get('border_color', '?')} ({_st.get('border_width', '?')}px)")
+                    print(f"    CapsLock:     {'SIM' if _st.get('caps_lock') else 'NAO'} | Anim: {_st.get('animation', 'none')} ({_st.get('anim_in_pct', 10)}%/{_st.get('anim_out_pct', 10)}%)")
+                    print(f"    Usar cache:   {'SIM' if _impact.get('use_cache') else 'NAO'}")
+                print("-" * 60)
+                print(f"  Logo:           {_logo_file}  (pos: {self.selected_logo_position})")
+                print(f"  Overlay:        {_overlay_file}")
+                print(f"  CTA:            {'SIM' if self.selected_cta_enabled else 'NAO'}  ({_cta_file})  chroma: {self.selected_cta_chroma_key}")
+                print("-" * 60)
+                print(f"  Volume Cenas:   {self.selected_vol_scene} dB")
+                print(f"  Volume Narr.:   {self.selected_vol_narration} dB")
+                print(f"  Volume CTA:     {self.selected_vol_cta} dB")
+                print(f"  Volume Música:  {self.selected_vol_music} dB")
+                print("=" * 60)
+
                 def on_export_project_done():
                     selected_script = self.script_select.get_selected_option()
                     save_result = self.premiere_manager.save_project(
@@ -547,7 +737,7 @@ class MainScreen:
                         return
 
                     messagebox.showinfo(
-                        'Projeto exportado', f'A exportação do projeto foi salva com sucesso em "{save_result.data}".')
+                        'Projeto exportado', f'A exportacao do projeto foi salva com sucesso em "{save_result.data}".')
                     self.on_working_done()
                     return
 
@@ -559,7 +749,23 @@ class MainScreen:
                 handle_thread_error(error, app)
 
         self.export_project_button.configure(command=on_export_project)
-        self.export_project_button.pack(pady=16)
+
+        # Frame inferior com botoes lado a lado
+        bottom_btns = tk.Frame(ep)
+        self.export_project_button.pack_forget()
+        self.export_project_button = tk.Button(bottom_btns, text='Exportar projeto',
+                                                font=('Arial', 10, 'bold'), bg='#2d7d46', fg='white',
+                                                padx=20, pady=4, command=on_export_project)
+        self.export_project_button.pack(side='left', padx=(0, 8))
+
+        def _open_renamer():
+            from ..screens.RenamerFeedbackScreen import RenamerFeedbackScreen
+            RenamerFeedbackScreen(app, self.settings_manager)
+
+        tk.Button(bottom_btns, text='Renomear Cenas',
+                  font=('Arial', 10, 'bold'), bg='#5C2D91', fg='white',
+                  padx=20, pady=4, command=_open_renamer).pack(side='left')
+        bottom_btns.pack(side='bottom', pady=(8, 12))
 
         def on_export_xml():
             try:
@@ -595,6 +801,197 @@ class MainScreen:
 
     def __get_fontes_dir(self) -> str:
         return os.path.join(self.__get_runtime_root(), "fontes")
+
+    def __get_logo_dir(self) -> str:
+        return os.path.join(self.__get_runtime_root(), "logo")
+
+    def __list_logo_files(self) -> list[str]:
+        d = self.__get_logo_dir()
+        try:
+            if not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+            files = []
+            for fn in os.listdir(d):
+                low = fn.lower()
+                if low.endswith("_10m.mp4") or '_10m_' in low:
+                    continue
+                if low.endswith((".png", ".jpg", ".jpeg", ".psd", ".tga", ".bmp", ".gif")):
+                    files.append(fn)
+            files.sort(key=lambda x: x.lower())
+            return files
+        except Exception:
+            return []
+
+    def __get_overlay_dir(self) -> str:
+        return os.path.join(self.__get_runtime_root(), "overlay")
+
+    def __get_cta_dir(self) -> str:
+        return os.path.join(self.__get_runtime_root(), "animacao")
+
+    def __list_overlay_files(self) -> list[str]:
+        d = self.__get_overlay_dir()
+        try:
+            if not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+            files = []
+            for fn in os.listdir(d):
+                low = fn.lower()
+                if low.endswith("_10m.mp4") or '_10m_' in low:
+                    continue
+                if low.endswith((".mp4", ".mov", ".avi", ".mxf", ".webm")):
+                    files.append(fn)
+            files.sort(key=lambda x: x.lower())
+            return files
+        except Exception:
+            return []
+
+    def __list_cta_files(self) -> list[str]:
+        d = self.__get_cta_dir()
+        try:
+            if not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+            files = []
+            for fn in os.listdir(d):
+                low = fn.lower()
+                if low.endswith((".mp4", ".mov", ".avi", ".webm")):
+                    files.append(fn)
+            files.sort(key=lambda x: x.lower())
+            return files
+        except Exception:
+            return []
+
+    def __update_logo_render_status(self):
+        try:
+            choice = (self.logo_choice_var.get() or "").strip()
+            if choice in ("", "(Nenhum)"):
+                self.logo_status_label.config(text='', fg='black')
+                return
+            logo_base = os.path.splitext(choice)[0]
+            pos = (self.logo_pos_var.get() or "bottom_right").replace(' ', '_')
+            res = (self.resolution_select.get_selected_option() or "1920 x 1080").replace(" ", "").replace("x", "x")
+            rendered = os.path.join(self.__get_logo_dir(), f'{logo_base}_10m_{pos}_{res}.mp4')
+            if os.path.exists(rendered) and os.path.getsize(rendered) > 0:
+                self.logo_status_label.config(text='(Renderizado)', fg='green')
+            else:
+                self.logo_status_label.config(text='(Nao renderizado)', fg='red')
+        except Exception:
+            self.logo_status_label.config(text='', fg='black')
+
+    def __update_overlay_render_status(self):
+        try:
+            choice = (self.overlay_choice_var.get() or "").strip()
+            if choice in ("", "(Nenhum)"):
+                self.overlay_status_label.config(text='', fg='black')
+                return
+            overlay_base = os.path.splitext(choice)[0]
+            rendered = os.path.join(self.__get_overlay_dir(), f'{overlay_base}_10m.mp4')
+            if os.path.exists(rendered) and os.path.getsize(rendered) > 0:
+                self.overlay_status_label.config(text='(Renderizado)', fg='green')
+            else:
+                self.overlay_status_label.config(text='(Nao renderizado)', fg='red')
+        except Exception:
+            self.overlay_status_label.config(text='', fg='black')
+
+    def __refresh_overlay_list(self):
+        try:
+            self._overlay_files = self.__list_overlay_files()
+            opts = ["(Nenhum)"] + self._overlay_files
+            cur = (self.overlay_choice_var.get() or "").strip()
+            if cur not in opts:
+                cur = "(Nenhum)"
+                self.overlay_choice_var.set(cur)
+            menu = self.overlay_menu["menu"]
+            menu.delete(0, "end")
+            for o in opts:
+                menu.add_command(label=o, command=tk._setit(self.overlay_choice_var, o))
+        except Exception:
+            pass
+
+    def __refresh_cta_list(self):
+        try:
+            self._cta_files = self.__list_cta_files()
+            opts = ["(Nenhum)"] + self._cta_files
+            cur = (self.cta_choice_var.get() or "").strip()
+            if cur not in opts:
+                cur = "(Nenhum)"
+                self.cta_choice_var.set(cur)
+            menu = self.cta_menu["menu"]
+            menu.delete(0, "end")
+            for o in opts:
+                menu.add_command(label=o, command=tk._setit(self.cta_choice_var, o))
+        except Exception:
+            pass
+
+    def _get_selected_overlay_path(self) -> str:
+        choice = (self.overlay_choice_var.get() or "").strip()
+        if choice in ("", "(Nenhum)"):
+            return ""
+        return os.path.join(self.__get_overlay_dir(), choice)
+
+    def _get_selected_cta_path(self) -> str:
+        choice = (self.cta_choice_var.get() or "").strip()
+        if choice in ("", "(Nenhum)"):
+            return ""
+        return os.path.join(self.__get_cta_dir(), choice)
+
+    def _refresh_style_list(self):
+        from ..dialogs.StyleEditorDialog import load_styles, get_selected_style_name
+        data = load_styles()
+        names = list(data.get("styles", {}).keys())
+        self._impact_style_names = names
+        cur = get_selected_style_name()
+        self.impact_style_var.set(cur)
+        menu = self.impact_style_menu["menu"]
+        menu.delete(0, "end")
+        for n in names:
+            menu.add_command(label=n, command=lambda v=n: self.impact_style_var.set(v))
+
+    def _on_style_changed_callback(self):
+        self._refresh_style_list()
+        self._update_impact_inline_preview()
+
+    def _update_impact_inline_preview(self):
+        try:
+            from ..dialogs.StyleEditorDialog import load_styles, render_preview_image, HAS_PIL
+            if not HAS_PIL:
+                return
+            style_name = (self.impact_style_var.get() or "Padrão").strip()
+            data = load_styles()
+            st = data.get("styles", {}).get(style_name, {})
+            font_file = self.impact_font_file_var.get() or ''
+            img = render_preview_image(st, 650, 70, font_file=font_file)
+            from PIL import ImageTk
+            self._impact_preview_photo = ImageTk.PhotoImage(img)
+            self._impact_preview_canvas.delete("all")
+            self._impact_preview_canvas.create_image(0, 0, anchor="nw", image=self._impact_preview_photo)
+        except Exception:
+            pass
+
+    def _get_selected_logo_path(self) -> str:
+        choice = (self.logo_choice_var.get() or "").strip()
+        if choice in ("", "(Nenhum)"):
+            return ""
+        return os.path.join(self.__get_logo_dir(), choice)
+
+    def __refresh_logo_list(self):
+        try:
+            self._logo_files = self.__list_logo_files()
+            options = ["(Nenhum)"] + self._logo_files
+
+            cur = (self.logo_choice_var.get() or "").strip()
+            if cur not in options:
+                cur = "(Nenhum)"
+                self.logo_choice_var.set(cur)
+
+            menu = self.logo_menu["menu"]
+            menu.delete(0, "end")
+            for opt in options:
+                menu.add_command(
+                    label=opt,
+                    command=tk._setit(self.logo_choice_var, opt)
+                )
+        except Exception:
+            pass
 
     def __list_font_files(self) -> list[str]:
         d = self.__get_fontes_dir()
@@ -705,6 +1102,58 @@ class MainScreen:
             # ---- frases impactantes ----
             try:
                 ui_cache["impact"] = self.get_impact_config()
+            except Exception:
+                pass
+
+            # ---- recursos visuais ----
+            try:
+                choice = (self.logo_choice_var.get() or "").strip()
+                ui_cache["logo_file"] = "" if choice == "(Nenhum)" else choice
+            except Exception:
+                pass
+
+            try:
+                ui_cache["logo_position"] = (self.logo_pos_var.get() or "bottom_right").strip()
+            except Exception:
+                pass
+
+            try:
+                ov_choice = (self.overlay_choice_var.get() or "").strip()
+                ui_cache["overlay_file"] = "" if ov_choice == "(Nenhum)" else ov_choice
+            except Exception:
+                pass
+
+            try:
+                ui_cache["cta_enabled"] = bool(self.cta_enable_var.get())
+            except Exception:
+                pass
+
+            try:
+                cta_choice = (self.cta_choice_var.get() or "").strip()
+                ui_cache["cta_file"] = "" if cta_choice == "(Nenhum)" else cta_choice
+            except Exception:
+                pass
+
+            try:
+                ui_cache["cta_chroma_key"] = bool(self.cta_chroma_var.get())
+            except Exception:
+                pass
+
+            # mixer de audio
+            try:
+                ui_cache["vol_scene"] = float(self.vol_scene_entry.get() or -99)
+            except Exception:
+                pass
+            try:
+                ui_cache["vol_narration"] = float(self.vol_narration_entry.get() or 0)
+            except Exception:
+                pass
+            try:
+                ui_cache["vol_cta"] = float(self.vol_cta_entry.get() or -9)
+            except Exception:
+                pass
+            try:
+                ui_cache["vol_music"] = float(self.vol_music_entry.get() or -12)
             except Exception:
                 pass
 
@@ -835,8 +1284,8 @@ class MainScreen:
                 pass
 
             try:
-                self.impact_pos_var.set(
-                    (impact.get("position") or "bottom").strip())
+                self.impact_use_cache_var.set(
+                    1 if impact.get("use_cache", False) else 0)
             except Exception:
                 pass
 
@@ -854,23 +1303,60 @@ class MainScreen:
             except Exception:
                 pass
 
-            try:
-                fs = impact.get("font_size_px", None)
-                self.impact_font_size_entry.delete(0, "end")
-                self.impact_font_size_entry.insert(
-                    0, "" if fs in (None, "") else str(fs))
-            except Exception:
-                pass
-
             # fonte da pasta fontes (nome do arquivo)
             try:
                 choice = (impact.get("font_choice") or "").strip()
                 if choice and choice in (self._font_files or []):
                     self.impact_font_choice_var.set(choice)
                 else:
-                    self.impact_font_choice_var.set("(Automático)")
+                    self.impact_font_choice_var.set("(Auto)")
             except Exception:
                 pass
+
+        # -------- recursos visuais --------
+        try:
+            logo = (ui_cache.get("logo_file") or "").strip()
+            if logo and logo in (self._logo_files or []):
+                self.logo_choice_var.set(logo)
+            else:
+                self.logo_choice_var.set("(Nenhum)")
+        except Exception:
+            pass
+
+        try:
+            lpos = (ui_cache.get("logo_position") or "bottom_right").strip()
+            if lpos in ("top_left", "top_right", "bottom_left", "bottom_right"):
+                self.logo_pos_var.set(lpos)
+        except Exception:
+            pass
+
+        try:
+            ov = (ui_cache.get("overlay_file") or "").strip()
+            if ov and ov in (self._overlay_files or []):
+                self.overlay_choice_var.set(ov)
+            else:
+                self.overlay_choice_var.set("(Nenhum)")
+        except Exception:
+            pass
+
+        try:
+            self.cta_enable_var.set(1 if ui_cache.get("cta_enabled") else 0)
+        except Exception:
+            pass
+
+        try:
+            ct = (ui_cache.get("cta_file") or "").strip()
+            if ct and ct in (self._cta_files or []):
+                self.cta_choice_var.set(ct)
+            else:
+                self.cta_choice_var.set("(Nenhum)")
+        except Exception:
+            pass
+
+        try:
+            self.cta_chroma_var.set(1 if ui_cache.get("cta_chroma_key", True) else 0)
+        except Exception:
+            pass
 
         # aplica visibilidade correta do modo
         try:
@@ -1060,33 +1546,32 @@ class MainScreen:
         except Exception:
             gap_s = 8.0
 
-        try:
-            pos = (self.impact_pos_var.get() or 'bottom').strip().lower()
-            if pos not in ('bottom', 'center', 'top'):
-                pos = 'bottom'
-        except Exception:
-            pos = 'bottom'
-
         # fonte vinda da pasta "fontes"
         try:
             choice = (self.impact_font_choice_var.get() or "").strip()
         except Exception:
             choice = ""
 
-        if choice in ("", "(Automático)"):
+        if choice in ("", "(Auto)"):
             font_choice = ""
             font_file = ""
         else:
             font_choice = choice
             font_file = os.path.join(self.__get_fontes_dir(), choice)
 
+        # Estilo visual (inclui font_size e position)
         try:
-            fs_raw = (self.impact_font_size_entry.get() or '').strip()
-            font_size_px = int(fs_raw) if fs_raw != '' else None
-            if font_size_px is not None:
-                font_size_px = max(12, min(200, font_size_px))
+            from ..dialogs.StyleEditorDialog import load_styles, DEFAULT_STYLE
+            style_name = (self.impact_style_var.get() or "Padrão").strip()
+            styles_data = load_styles()
+            text_style = dict(DEFAULT_STYLE)
+            text_style.update(styles_data.get("styles", {}).get(style_name, {}))
+            styles_data["selected"] = style_name
         except Exception:
-            font_size_px = None
+            text_style = {}
+
+        font_size_px = text_style.get("font_size", None)
+        pos = text_style.get("position", "bottom")
 
         return {
             "enabled": enabled,
@@ -1096,7 +1581,9 @@ class MainScreen:
             "position": pos,
             "font_choice": font_choice,
             "font_file": font_file,
-            "font_size_px": font_size_px
+            "font_size_px": font_size_px,
+            "text_style": text_style,
+            "use_cache": bool(self.impact_use_cache_var.get()),
         }
 
     def get_mass_order(self) -> str:
@@ -1327,7 +1814,6 @@ class MainScreen:
                 paths_map=paths_map,
                 narrations_map=narrations_map,
 
-                # NOVO: transcrições completas + config GPT
                 narrations_transcriptions=narrations_transcriptions_result.data,
                 impact_phrases_config=impact_cfg,
                 openai_api_key=openai_key,
@@ -1342,7 +1828,21 @@ class MainScreen:
                 fill_gaps_with_random_scenes=getattr(
                     self, 'selected_fill_gaps_without_scene', False),
                 max_fill_scene_duration=getattr(
-                    self, 'selected_max_fill_scene_duration', 0.0)
+                    self, 'selected_max_fill_scene_duration', 0.0),
+
+                # Recursos visuais
+                logo_path=getattr(self, 'selected_logo_path', ''),
+                logo_position=getattr(self, 'selected_logo_position', 'bottom_right'),
+                overlay_path=getattr(self, 'selected_overlay_path', ''),
+                cta_enabled=getattr(self, 'selected_cta_enabled', False),
+                cta_anim_path=getattr(self, 'selected_cta_anim_path', ''),
+                cta_chroma_key=getattr(self, 'selected_cta_chroma_key', True),
+
+                # Mixer
+                vol_scene_db=getattr(self, 'selected_vol_scene', -99.0),
+                vol_narration_db=getattr(self, 'selected_vol_narration', 0.0),
+                vol_cta_db=getattr(self, 'selected_vol_cta', -9.0),
+                vol_music_db=getattr(self, 'selected_vol_music', -12.0),
             )
 
             if mount_sequence_result.success == False:
@@ -1358,12 +1858,12 @@ class MainScreen:
     def __refresh_font_list(self):
         try:
             self._font_files = self.__list_font_files()
-            options = ["(Automático)"] + self._font_files
+            options = ["(Auto)"] + self._font_files
 
             # mantém seleção atual se ainda existir
             cur = (self.impact_font_choice_var.get() or "").strip()
             if cur not in options:
-                cur = "(Automático)"
+                cur = "(Auto)"
                 self.impact_font_choice_var.set(cur)
 
             # atualiza o menu do OptionMenu
