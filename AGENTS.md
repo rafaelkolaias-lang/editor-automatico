@@ -1,0 +1,2 @@
+Leia o arquivo `D:\regra-global-LLM\RULES.md` para todas as regras e convenções. (Caso não ache questione o usuario onde está a regra global)
+Leia o arquivo `temporary_rules.md` na raiz desse projeto para regras temporárias específicas do projeto em que o arquivo se encontra.
