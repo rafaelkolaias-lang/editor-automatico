@@ -1,5 +1,7 @@
 # Arquivos grandes/binários
 *.rar
+*.zip
+*.exe
 *.mp4
 *.mp3
 *.wav
@@ -14,6 +16,8 @@ musica/
 partes/
 cenas/
 fontes/
+_internal/
+projeto-compilado/
 
 # FFmpeg binário
 ffmpeg/
