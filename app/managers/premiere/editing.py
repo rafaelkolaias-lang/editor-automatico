@@ -383,6 +383,27 @@ def mount_sequence(
                 raise Exception(
                     f'Transcription for narration "{narration_file}" not found')
 
+            # [gap-debug] Mapa das parts (cenas casadas) desta narração
+            try:
+                _narr_dur_s = float(narration_clip.end.seconds) - float(last_narration_end.seconds)
+                print(f"[gap-debug] === narr='{narration_file}' dur={_narr_dur_s:.1f}s "
+                      f"parts={len(narration_transcription_parts)} "
+                      f"(dup={duplicate_scenes_until_next} fill={fill_gaps_with_random_scenes} "
+                      f"max_fill={max_fill_scene_duration}s) ===")
+                for _i, _p in enumerate(narration_transcription_parts):
+                    if _i + 1 < len(narration_transcription_parts):
+                        _next_s = narration_transcription_parts[_i + 1].start / 1000.0
+                    else:
+                        _next_s = _narr_dur_s
+                    _start_s = (_p.start / 1000.0) if _i > 0 else 0.0
+                    _gap_alvo = max(0.0, _next_s - _start_s)
+                    if _gap_alvo > 30.0:
+                        print(f"[gap-debug]   part#{_i:03d} start={_start_s:7.1f}s "
+                              f"-> next={_next_s:7.1f}s alvo={_gap_alvo:6.1f}s "
+                              f"cena='{_p.text}'  <-- GAP GRANDE")
+            except Exception as _e:
+                print(f"[gap-debug] erro ao logar parts: {_e}")
+
             for part_index, part in enumerate(narration_transcription_parts):
                 scene_start = last_narration_end if part_index == 0 else pymiere.wrappers.time_from_seconds(
                     last_narration_end.seconds + part.start / 1000
@@ -499,15 +520,30 @@ def mount_sequence(
                         last_used = part.text
                         MIN_FILL_SEC = 3.0
                         safety = 0
+                        # [gap-debug] início do fill
+                        _gap_alvo_dbg = next_scene_start.seconds - current_scene_end.seconds
+                        _fill_start_dbg = current_scene_end.seconds
+                        _fill_inserted_dbg = 0
+                        _fill_rejected_r1_dbg = 0
+                        _fill_rejected_r2_dbg = 0
+                        _fill_import_fail_dbg = 0
+                        _fill_break_reason_dbg = "OK"
+                        if _gap_alvo_dbg > 30.0:
+                            print(f"[gap-debug] FILL inicio: part#{part_index:03d} "
+                                  f"em t={current_scene_end.seconds:.1f}s, "
+                                  f"alvo até t={next_scene_start.seconds:.1f}s "
+                                  f"(gap={_gap_alvo_dbg:.1f}s)")
                         while current_scene_end.seconds < next_scene_start.seconds - 1e-6 and safety < 50:
                             # Não adiciona um clipe se o espaço restante for muito curto.
                             # Isso evita criar clipes "picotados" (ex.: 2s) quando sobra pouco tempo até a próxima cena.
                             remaining_gap = next_scene_start.seconds - current_scene_end.seconds
                             if remaining_gap < 3.0:
+                                _fill_break_reason_dbg = f"resto<3s ({remaining_gap:.2f}s)"
                                 break
 
                             safety += 1
                             if not _scene_candidates:
+                                _fill_break_reason_dbg = "sem candidatos"
                                 break
 
                             candidates = [f for f in _scene_candidates if f != last_used] or list(
@@ -523,6 +559,10 @@ def mount_sequence(
                                 rand_path, project_item_cache)
                             if imported_rand == mgr.PYMIERE_UNDEFINED:
                                 # tenta outra sem quebrar o projeto inteiro
+                                _fill_import_fail_dbg += 1
+                                if _gap_alvo_dbg > 30.0:
+                                    print(f"[gap-debug]   import FALHOU '{random_file}' "
+                                          f"(safety={safety}/50)")
                                 continue
 
                             prev_end = current_scene_end.seconds
@@ -535,7 +575,13 @@ def mount_sequence(
 
                             # Se o Premiere não avançar o tempo, trava anti-loop
                             if current_scene_end.seconds <= prev_end + 1e-6:
+                                _fill_break_reason_dbg = (
+                                    f"ANTI-LOOP cena '{random_file}' nao avancou tempo "
+                                    f"(prev={prev_end:.2f}s atual={current_scene_end.seconds:.2f}s)"
+                                )
                                 break
+
+                            _fill_inserted_dbg += 1
 
                             # --- REGRA 1: nao aceita clipe menor que o minimo (3s) ---
                             # Usa inserted_scene_clips ao inves de list(track.clips) para evitar IPC O(N)
@@ -543,6 +589,10 @@ def mount_sequence(
                             if last_clip_tmp is not None:
                                 last_len_tmp = last_clip_tmp.end.seconds - last_clip_tmp.start.seconds
                                 if last_len_tmp + 1e-6 < MIN_FILL_SEC:
+                                    _fill_rejected_r1_dbg += 1
+                                    if _gap_alvo_dbg > 30.0 and _fill_rejected_r1_dbg <= 3:
+                                        print(f"[gap-debug]   REGRA1 rejeitou '{random_file}' "
+                                              f"len={last_len_tmp:.2f}s<3s (safety={safety}/50)")
                                     last_clip_tmp.remove(False, False)
                                     scenes_repetition_count = prev_rep
                                     del inserted_scene_dims[prev_dims_len:]
@@ -554,6 +604,7 @@ def mount_sequence(
                             # --- REGRA 2: evita sobrar "restinho" preto (< 3s) ---
                             remaining_after = next_scene_start.seconds - current_scene_end.seconds
                             if 0 < remaining_after < MIN_FILL_SEC - 1e-6:
+                                _fill_rejected_r2_dbg += 1
                                 delta = MIN_FILL_SEC - remaining_after
                                 last_clip_tmp = inserted_scene_clips[-1] if inserted_scene_clips else None
 
@@ -592,6 +643,19 @@ def mount_sequence(
                                         current_scene_end = pymiere.wrappers.time_from_seconds(
                                             prev_end)
                                         continue
+
+                        # [gap-debug] resumo final do fill desta part
+                        if safety >= 50 and current_scene_end.seconds < next_scene_start.seconds - 1e-6:
+                            _fill_break_reason_dbg = "SAFETY=50 esgotado"
+                        _coberto = current_scene_end.seconds - _fill_start_dbg
+                        _faltou = next_scene_start.seconds - current_scene_end.seconds
+                        if _gap_alvo_dbg > 30.0 or _faltou > 1.0:
+                            print(f"[gap-debug] FILL fim part#{part_index:03d}: "
+                                  f"alvo={_gap_alvo_dbg:.1f}s coberto={_coberto:.1f}s "
+                                  f"faltou={_faltou:.1f}s | inseridas={_fill_inserted_dbg} "
+                                  f"R1={_fill_rejected_r1_dbg} R2={_fill_rejected_r2_dbg} "
+                                  f"impFail={_fill_import_fail_dbg} safety={safety}/50 | "
+                                  f"motivo='{_fill_break_reason_dbg}'")
 
                 # Corte de cena excedente
                 # Modo rapido (duplicar/gaps habilitado):

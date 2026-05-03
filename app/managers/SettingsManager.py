@@ -20,11 +20,9 @@ class SettingsManager:
         if os.path.exists(self.SETTINGS_PATH):
             return
 
+        # Bloco `env` foi removido: API keys vem do servidor (manual-credenciais)
+        # e nao sao persistidas em disco.
         settings = {
-            'env': {
-                'ASSEMBLY_AI_KEY': '',
-                'OPENAI_API_KEY': ''
-            },
             'ui_cache': {
                 # selects
                 'mode': 'transcription',
@@ -70,8 +68,21 @@ class SettingsManager:
     def read_settings(self) -> dict:
         self.ensure_settings()
         with open(self.SETTINGS_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        # Migracao: remove bloco `env` herdado de versoes antigas para
+        # evitar que API keys continuem em disco (manual-credenciais).
+        if isinstance(data, dict) and "env" in data:
+            data.pop("env", None)
+            try:
+                with open(self.SETTINGS_PATH, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+        return data
 
     def write_settings(self, settings: dict):
+        # Forca remocao de `env` antes de gravar: credenciais nao vao para disco.
+        if isinstance(settings, dict):
+            settings.pop("env", None)
         with open(self.SETTINGS_PATH, "w", encoding="utf-8") as f:
             json.dump(settings, f, indent=2, ensure_ascii=False)

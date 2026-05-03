@@ -4,7 +4,6 @@ import os
 import subprocess
 import time
 import random
-import shutil
 import textwrap
 import pymiere
 import pymiere.wrappers
@@ -2108,41 +2107,17 @@ class PremiereManager():
         """
         Retorna o caminho do binário do FFmpeg. Tenta:
         1) variável de ambiente FFMPEG_BIN
-        2) 'ffmpeg' no PATH
-        3) locais comuns por SO
+        2) ffmpeg bundled junto ao executável/projeto (ffmpeg/bin/)
+        3) 'ffmpeg' no PATH
         """
         # 1) env
         env_bin = os.environ.get('FFMPEG_BIN')
         if env_bin and os.path.exists(env_bin):
             return env_bin
 
-        # 2) PATH
-        which = shutil.which('ffmpeg')
-        if which:
-            return which
-
-        # 3) locais comuns
-        candidates = []
-        if os.name == 'nt':
-            candidates += [
-                r'C:\ffmpeg\bin\ffmpeg.exe',
-                r'C:\Program Files\ffmpeg\bin\ffmpeg.exe',
-                r'C:\Program Files\FFmpeg\bin\ffmpeg.exe',
-                r'C:\ProgramData\chocolatey\bin\ffmpeg.exe'
-            ]
-        else:
-            candidates += [
-                '/opt/homebrew/bin/ffmpeg',  # macOS (Apple Silicon)
-                '/usr/local/bin/ffmpeg',     # macOS (Intel) / Linux
-                '/usr/bin/ffmpeg'
-            ]
-
-        for c in candidates:
-            if os.path.exists(c):
-                return c
-
-        # último recurso: retorna 'ffmpeg' mesmo (pode estar acessível ao Premiere via PATH)
-        return 'ffmpeg'
+        # 2) bundled + PATH (via utilitário centralizado)
+        from app.utils.ffmpeg_path import get_ffmpeg_bin
+        return get_ffmpeg_bin()
 
     def __write_ffmpeg_debug(self, log_dir: str, cmd: list[str], proc: subprocess.CompletedProcess, tag: str):
         """Grava o comando e stderr/stdout do FFmpeg para depuração."""

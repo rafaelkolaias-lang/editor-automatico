@@ -1,16 +1,21 @@
 import os
 import re
+import sys
 import json
 import time
 import textwrap
 import subprocess
 import unicodedata
+
+# Oculta console preto do subprocess (ffmpeg) em Windows --windowed.
+_NO_WINDOW_FLAGS = 0x08000000 if sys.platform == 'win32' else 0
 from typing import Optional, Any, List, Tuple, Dict
 
 import requests
 from requests.adapters import HTTPAdapter
 
 from ..entities import Result, Dimensions, Transcription, TranscriptionWord
+from core.remote_credentials import get_api_key
 
 
 class TextOnScreenManager:
@@ -24,13 +29,13 @@ class TextOnScreenManager:
     4) (Opcional) Insere os .mov na timeline do Premiere em uma trilha de vídeo específica.
     """
 
-    OPENAI_API_KEY: str = ''
     OPENAI_BASE_URL: str = 'https://api.openai.com/v1'
     # Modelo default seguro p/ Structured Outputs; você pode trocar depois no settings
     OPENAI_MODEL: str = 'gpt-4o-mini'
 
     def __init__(self, openai_api_key: str = '', ffmpeg_bin: str = 'ffmpeg'):
-        self.OPENAI_API_KEY = openai_api_key or ''
+        # Parametro openai_api_key mantido por compatibilidade, mas a credencial
+        # e obtida sob demanda via core.remote_credentials (manual-credenciais).
         self.FFMPEG_BIN = ffmpeg_bin or 'ffmpeg'
 
         # Session HTTP com keep-alive (evita abrir conexão nova toda hora)
@@ -43,7 +48,12 @@ class TextOnScreenManager:
             pass
 
     def set_api_key(self, openai_api_key: str):
-        self.OPENAI_API_KEY = openai_api_key or ''
+        """No-op — credencial obtida sob demanda do servidor."""
+        pass
+
+    @property
+    def OPENAI_API_KEY(self) -> str:
+        return get_api_key('OPENAI_API_KEY')
 
     # -----------------------------
     # Utils: texto / normalização
@@ -720,7 +730,8 @@ class TextOnScreenManager:
     def __run_ffmpeg(self, cmd: List[str], debug_dir: Optional[str] = None, tag: str = "run") -> bool:
         try:
             proc = subprocess.run(
-                cmd, check=False, capture_output=True, text=True)
+                cmd, check=False, capture_output=True, text=True,
+                creationflags=_NO_WINDOW_FLAGS)
             if debug_dir:
                 self.__write_ffmpeg_debug(debug_dir, cmd, proc, tag)
             return proc.returncode == 0

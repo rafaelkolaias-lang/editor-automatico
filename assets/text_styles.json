@@ -47,7 +47,25 @@
       "box_opacity": 0.0,
       "caps_lock": true,
       "animation": "none"
+    },
+    "Estilo teste": {
+      "font_color": "#FFFF00",
+      "border_color": "#000000",
+      "border_width": 6,
+      "shadow_x": 3,
+      "shadow_y": 3,
+      "shadow_color": "#000000",
+      "shadow_opacity": 0.55,
+      "box_enabled": false,
+      "box_color": "#000000",
+      "box_opacity": 0.0,
+      "caps_lock": true,
+      "animation": "fade",
+      "anim_in_pct": 10,
+      "anim_out_pct": 10,
+      "font_size": 80,
+      "position": "center"
     }
   },
-  "selected": "Impacto Amarelo"
+  "selected": "Estilo teste"
 }

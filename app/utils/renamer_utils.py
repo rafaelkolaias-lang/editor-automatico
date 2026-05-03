@@ -12,6 +12,10 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
+from app.utils.ffmpeg_path import get_ffmpeg_bin, get_ffprobe_bin
+
+# Oculta console preto do subprocess (ffmpeg/ffprobe) em Windows --windowed.
+_NO_WINDOW_FLAGS = 0x08000000 if sys.platform == 'win32' else 0
 
 # ---------------------------
 # Extensões suportadas
@@ -485,18 +489,20 @@ def _phrase_key(text: str) -> str:
 
 def _ffprobe_duration_seconds(path: str) -> Optional[float]:
     """Retorna a duração do vídeo em segundos usando ffprobe."""
-    if shutil.which("ffprobe") is None:
+    ffprobe = get_ffprobe_bin()
+    if not os.path.isabs(ffprobe) and shutil.which(ffprobe) is None:
         return None
 
     try:
         cmd = [
-            "ffprobe",
+            ffprobe,
             "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
             path,
         ]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           creationflags=_NO_WINDOW_FLAGS)
         if r.returncode != 0:
             return None
         s = (r.stdout or "").strip()
@@ -554,7 +560,8 @@ def _ffmpeg_extract_clip_to_temp(
     Recorta um trecho do vídeo com ffmpeg e salva num arquivo temporário (.mp4).
     Retorna (caminho_temp, None) em caso de sucesso ou (None, mensagem_erro) em falha.
     """
-    if shutil.which("ffmpeg") is None:
+    ffmpeg = get_ffmpeg_bin()
+    if not os.path.isabs(ffmpeg) and shutil.which(ffmpeg) is None:
         return None, "ffmpeg não foi encontrado no sistema."
 
     cmd = []
@@ -565,7 +572,7 @@ def _ffmpeg_extract_clip_to_temp(
         tmp.close()
 
         cmd = [
-            "ffmpeg", "-y",
+            ffmpeg, "-y",
             "-ss", f"{start_s:.3f}",
             "-i", in_path,
             "-t", f"{duration_s:.3f}",
@@ -585,7 +592,8 @@ def _ffmpeg_extract_clip_to_temp(
             tmp_path,
         ]
 
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                           creationflags=_NO_WINDOW_FLAGS)
         if r.returncode != 0:
             if tmp_path and os.path.exists(tmp_path):
                 try:
@@ -617,7 +625,8 @@ def _ffmpeg_remove_audio_to_temp(in_path: str) -> Tuple[Optional[str], Optional[
     Remove o áudio do vídeo e salva num arquivo temporário (.mp4).
     Retorna (caminho_temp, None) ou (None, mensagem_erro).
     """
-    if shutil.which("ffmpeg") is None:
+    ffmpeg = get_ffmpeg_bin()
+    if not os.path.isabs(ffmpeg) and shutil.which(ffmpeg) is None:
         return None, "ffmpeg não foi encontrado no sistema."
 
     cmd = []
@@ -628,7 +637,7 @@ def _ffmpeg_remove_audio_to_temp(in_path: str) -> Tuple[Optional[str], Optional[
         tmp.close()
 
         cmd = [
-            "ffmpeg", "-y",
+            ffmpeg, "-y",
             "-i", in_path,
             "-map", "0:v:0?",
             "-an",
@@ -639,7 +648,8 @@ def _ffmpeg_remove_audio_to_temp(in_path: str) -> Tuple[Optional[str], Optional[
             tmp_path,
         ]
 
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                           creationflags=_NO_WINDOW_FLAGS)
         if r.returncode != 0:
             if tmp_path and os.path.exists(tmp_path):
                 try:

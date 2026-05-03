@@ -5,6 +5,7 @@ import io
 import sys
 import json
 import time
+import random
 import shutil
 import threading
 import hashlib
@@ -18,6 +19,11 @@ from typing import List, Optional, Tuple, Set
 
 import numpy as np
 from PIL import Image
+from app.utils.ffmpeg_path import get_ffmpeg_bin, get_ffprobe_bin
+
+# Oculta o console preto do subprocess (ffmpeg/ffprobe) no Windows quando
+# rodando como .exe --windowed. Sem isso, cada chamada abre um cmd visivel.
+_NO_WINDOW_FLAGS = 0x08000000 if sys.platform == 'win32' else 0
 
 from google import genai
 from google.genai import types
@@ -516,7 +522,8 @@ def _ffmpeg_extract_clip_to_temp(
       - caminho do arquivo temporário, se der certo
       - mensagem de erro amigável para log, se der errado
     """
-    if shutil.which("ffmpeg") is None:
+    ffmpeg = get_ffmpeg_bin()
+    if not os.path.isabs(ffmpeg) and shutil.which(ffmpeg) is None:
         return None, "ffmpeg não foi encontrado no sistema (não está instalado ou não está no PATH)."
 
     cmd = []
@@ -528,7 +535,7 @@ def _ffmpeg_extract_clip_to_temp(
 
         # Re-encode para ser robusto (cópia direta pode falhar por keyframe)
         cmd = [
-            "ffmpeg", "-y",
+            ffmpeg, "-y",
             "-ss", f"{start_s:.3f}",
             "-i", in_path,
             "-t", f"{duration_s:.3f}",
@@ -549,7 +556,8 @@ def _ffmpeg_extract_clip_to_temp(
         ]
 
         r = subprocess.run(cmd, capture_output=True,
-                           text=True, errors="replace")
+                           text=True, errors="replace",
+                           creationflags=_NO_WINDOW_FLAGS)
         if r.returncode != 0:
             if tmp_path and os.path.exists(tmp_path):
                 try:
@@ -585,7 +593,8 @@ def _ffmpeg_remove_audio_to_temp(in_path: str) -> Tuple[Optional[str], Optional[
       - caminho do arquivo temporário, se der certo
       - mensagem de erro amigável para log, se der errado
     """
-    if shutil.which("ffmpeg") is None:
+    ffmpeg = get_ffmpeg_bin()
+    if not os.path.isabs(ffmpeg) and shutil.which(ffmpeg) is None:
         return None, "ffmpeg não foi encontrado no sistema (não está instalado ou não está no PATH)."
 
     cmd = []
@@ -596,7 +605,7 @@ def _ffmpeg_remove_audio_to_temp(in_path: str) -> Tuple[Optional[str], Optional[
         tmp.close()
 
         cmd = [
-            "ffmpeg", "-y",
+            ffmpeg, "-y",
             "-i", in_path,
             "-map", "0:v:0?",
             "-an",
@@ -608,7 +617,8 @@ def _ffmpeg_remove_audio_to_temp(in_path: str) -> Tuple[Optional[str], Optional[
         ]
 
         r = subprocess.run(cmd, capture_output=True,
-                           text=True, errors="replace")
+                           text=True, errors="replace",
+                           creationflags=_NO_WINDOW_FLAGS)
         if r.returncode != 0:
             if tmp_path and os.path.exists(tmp_path):
                 try:
@@ -640,18 +650,20 @@ def _ffprobe_duration_seconds(path: str) -> Optional[float]:
     Retorna a duração do vídeo em segundos usando ffprobe.
     Se não tiver ffprobe, retorna None (e aí não recorta).
     """
-    if shutil.which("ffprobe") is None:
+    ffprobe = get_ffprobe_bin()
+    if not os.path.isabs(ffprobe) and shutil.which(ffprobe) is None:
         return None
 
     try:
         cmd = [
-            "ffprobe",
+            ffprobe,
             "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
             path,
         ]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           creationflags=_NO_WINDOW_FLAGS)
         if r.returncode != 0:
             return None
         s = (r.stdout or "").strip()
@@ -761,6 +773,33 @@ def _is_quota_pro_zero_error(err: Exception) -> bool:
     if "429" in msg_low and "resource_exhausted" in msg_low:
         if "gemini-2.5-pro" in msg_low and ("limit: 0" in msg_low or "free_tier" in msg_low):
             return True
+    return False
+
+
+class QuotaExhaustedError(RuntimeError):
+    """Gemini recusou repetidamente por cota/rate limit temporario."""
+    pass
+
+
+def _is_rate_limit_error(err: Exception) -> bool:
+    """
+    Reconhece rate limit / quota temporaria do Gemini em varias formas:
+    - 429 RESOURCE_EXHAUSTED
+    - mensagem contem 'rate limit' / 'rate_limit' / 'quota'
+    - nome da excecao parece com ResourceExhausted
+    """
+    if err is None:
+        return False
+    msg = str(err).lower()
+    cls = type(err).__name__.lower()
+    if "resourceexhausted" in cls or "ratelimit" in cls or "toomanyrequests" in cls:
+        return True
+    if "429" in msg and ("resource_exhausted" in msg or "rate" in msg or "quota" in msg):
+        return True
+    if "rate limit" in msg or "rate_limit" in msg:
+        return True
+    if "quota" in msg and ("exceed" in msg or "exhaust" in msg):
+        return True
     return False
 
 
@@ -1296,18 +1335,75 @@ def describe_all_scenes(
 # Gemini: Embeddings (texto -> vetor)
 # ---------------------------
 
-def get_embeddings_batched(client: genai.Client, model: str, texts: List[str], batch_size: int = 200) -> List[List[float]]:
+_EMBEDDING_BACKOFF_SECONDS = (5.0, 10.0, 20.0, 40.0, 60.0)
+
+
+def get_embeddings_batched(
+    client: genai.Client,
+    model: str,
+    texts: List[str],
+    batch_size: int = 100,
+    log_fn=None,
+    max_attempts: int = 5,
+) -> List[List[float]]:
+    """
+    Gera embeddings em lotes com retry/backoff para rate limit do Gemini.
+
+    Quando o Gemini retorna 429/RESOURCE_EXHAUSTED, tenta novamente ate
+    max_attempts vezes por lote, respeitando 'Please retry in Xs/ms' quando
+    vier na mensagem; caso contrario usa backoff progressivo com jitter.
+
+    Se esgotar tentativas em um erro de rate limit, levanta
+    QuotaExhaustedError para o chamador distinguir de erros definitivos.
+    """
     batch_size = min(int(batch_size), 100)  # limite da API
+    if batch_size <= 0:
+        batch_size = 100
     vectors: List[List[float]] = []
-    for i in range(0, len(texts), batch_size):
+    total = len(texts)
+    total_batches = (total + batch_size - 1) // batch_size if total else 0
+
+    for batch_idx, i in enumerate(range(0, total, batch_size), start=1):
         chunk = texts[i:i + batch_size]
-        resp = client.models.embed_content(
-            model=model,
-            contents=chunk,
-            config=types.EmbedContentConfig(task_type="SEMANTIC_SIMILARITY"),
-        )
-        for emb in resp.embeddings:
-            vectors.append(list(emb.values))
+        end = i + len(chunk) - 1
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = client.models.embed_content(
+                    model=model,
+                    contents=chunk,
+                    config=types.EmbedContentConfig(task_type="SEMANTIC_SIMILARITY"),
+                )
+                vectors.extend(list(emb.values) for emb in resp.embeddings)
+                break
+            except Exception as exc:
+                is_rate = _is_rate_limit_error(exc)
+
+                if not is_rate:
+                    raise
+
+                if attempt >= max_attempts:
+                    raise QuotaExhaustedError(
+                        f"Gemini recusou embeddings por cota/rate limit "
+                        f"(lote {batch_idx}/{total_batches}, itens {i}-{end}, "
+                        f"{attempt} tentativa(s)): {exc}"
+                    ) from exc
+
+                retry_s = _extract_retry_seconds_from_message(str(exc))
+                if retry_s is None:
+                    base_idx = min(attempt - 1, len(_EMBEDDING_BACKOFF_SECONDS) - 1)
+                    retry_s = _EMBEDDING_BACKOFF_SECONDS[base_idx]
+                retry_s = max(1.0, retry_s) + random.uniform(0.0, 1.5)
+
+                if log_fn:
+                    log_fn(
+                        f"[Gemini-embedding] Lote {batch_idx}/{total_batches} "
+                        f"(itens {i}-{end}) recebeu rate limit "
+                        f"(tentativa {attempt}/{max_attempts}). "
+                        f"Aguardando {retry_s:.1f}s antes de tentar novamente..."
+                    )
+                time.sleep(retry_s)
+
     return vectors
 
 
@@ -1636,14 +1732,14 @@ def build_global_assignment(
 
     log_fn(f"Gerando embeddings do roteiro ({len(script_items)} itens)...")
     script_vecs = get_embeddings_batched(
-        client, GEMINI_EMBEDDING_MODEL, script_items
+        client, GEMINI_EMBEDDING_MODEL, script_items, log_fn=log_fn
     )
     script_mat = normalize_rows(np.array(script_vecs, dtype=np.float32))
 
     log_fn(f"Gerando embeddings das cenas ({len(scene_descs)} descrições)...")
     scene_texts = [s.desc_text for s in scene_descs]
     scene_vecs = get_embeddings_batched(
-        client, GEMINI_EMBEDDING_MODEL, scene_texts
+        client, GEMINI_EMBEDDING_MODEL, scene_texts, log_fn=log_fn
     )
     scene_mat = normalize_rows(np.array(scene_vecs, dtype=np.float32))
 
@@ -1935,7 +2031,7 @@ class SceneRenamerManager:
         return build_global_assignment(script_items, scene_descs, self.client, self.log_fn, max_uses_per_scene=max_uses_per_scene, initial_scene_use_counts=initial_scene_use_counts, min_similarity=min_similarity or MIN_SIMILARITY, min_assign_score=min_assign_score or MIN_ASSIGN_SCORE)
 
     def get_embeddings(self, texts):
-        return get_embeddings_batched(self.client, GEMINI_EMBEDDING_MODEL, texts)
+        return get_embeddings_batched(self.client, GEMINI_EMBEDDING_MODEL, texts, log_fn=self.log_fn)
 
     def load_config(self):
         return load_config()

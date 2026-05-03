@@ -1,9 +1,17 @@
+import sys
 from os import path
 from PIL import Image
-from moviepy import VideoFileClip
+try:
+    from moviepy.editor import VideoFileClip  # moviepy 1.x
+except ImportError:
+    from moviepy import VideoFileClip  # moviepy 2.x
 import subprocess
 
 from ..entities import EXTENSIONS, Result
+from ..utils.ffmpeg_path import get_ffmpeg_bin
+
+# Oculta console preto do subprocess (ffmpeg) em Windows --windowed.
+_NO_WINDOW_FLAGS = 0x08000000 if sys.platform == 'win32' else 0
 
 class ConversionManager:
   UNDERLINE = '_'
@@ -46,7 +54,9 @@ class ConversionManager:
       if path.exists(save_path):
         return Result(success=True, data=save_path)
 
-      conversion_return = subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', audio_path, save_path])
+      conversion_return = subprocess.run(
+          [get_ffmpeg_bin(), '-hide_banner', '-loglevel', 'error', '-i', audio_path, save_path],
+          creationflags=_NO_WINDOW_FLAGS)
 
       successful_conversion = conversion_return.returncode == 0
 

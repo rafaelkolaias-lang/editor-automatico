@@ -3,78 +3,276 @@
 ================================================================
 
 ────────────────────────────────────────────────────────────────
+  VERSÃO 2.4 (15/04/2026)
+────────────────────────────────────────────────────────────────
+
+CORRECOES:
+
+  Fechar a janela agora encerra o app de verdade
+  - Antes, fechar o editor automatico no X deixava o processo
+    Python/Editor.exe rodando em segundo plano e enchia o
+    terminal de erros em cascata enquanto workers tentavam
+    desenhar em uma UI ja destruida.
+  - Agora o fechamento limpa as credenciais em memoria,
+    restaura stdout/stderr originais, fecha o terminal e
+    encerra o processo de uma vez. Exportacoes em andamento
+    sao interrompidas junto.
+
+  Erro de transcricao mostra a causa real
+  - Quando a AssemblyAI recusava um audio, o app tentava
+    automaticamente normalizar o arquivo (criar um MP3
+    convertido) e reenviar, escondendo a causa real do
+    problema. Isso foi removido.
+  - Agora, em caso de recusa, o app mostra direto a
+    mensagem real da AssemblyAI ("Erro principal: ...")
+    junto da lista de arquivos recusados, sem mascarar com
+    fallback de formato.
+
+  Transcricao voltou a funcionar (modelo de fala obrigatorio)
+  - A AssemblyAI passou a exigir o envio explicito da lista de
+    modelos de fala. Sem isso, todos os audios eram recusados
+    com erro 400 e a transcricao nem comecava.
+  - O app agora envia automaticamente a lista
+    ['universal-3-pro', 'universal-2'], com fallback pro
+    'universal-2' caso o pro nao esteja disponivel na sua
+    conta.
+  - Se mesmo assim aparecer erro de configuracao de modelos,
+    a mensagem agora deixa claro que e configuracao da API
+    (e nao formato de audio ou credencial errada).
+
+  Validacao e normalizacao de audios na transcricao
+  - Antes de enviar pra AssemblyAI, o app agora checa se o
+    audio existe, tem tamanho valido, extensao conhecida e
+    duracao maior que zero. Arquivos invalidos sao detectados
+    na hora, sem esperar timeout.
+  - Um log detalhado mostra no terminal o arquivo, tamanho em
+    MB, extensao, duracao e codec antes do envio.
+  - Se a AssemblyAI recusar um audio, o app agora converte
+    automaticamente pra MP3 mono 44.1kHz 128k via FFmpeg e
+    tenta de novo antes de desistir.
+  - Quando todos os audios sao recusados mesmo apos a
+    segunda tentativa, a mensagem final lista os nomes dos
+    arquivos que falharam, nao so a contagem.
+
+  Transcricao recusada pelo AssemblyAI
+  - Em alguns casos, todos os audios falhavam com mensagem
+    tecnica sobre "modelo de fala" e um popup fatal aparecia.
+  - Agora o app usa o modelo padrao da conta AssemblyAI
+    (compatibilidade maior) e, quando a transcricao e recusada,
+    mostra uma mensagem clara informando quantos audios
+    falharam e o que verificar (formato dos audios e
+    credencial), sem mais popup de erro generico.
+
+  Timeout no upload do AssemblyAI (transcricao)
+  - Antes, arquivos de audio maiores ou conexoes mais lentas
+    podiam travar com erro de "ReadTimeout" durante o envio pro
+    AssemblyAI, interrompendo a transcricao.
+  - Agora o tempo limite foi ampliado pra 5 minutos por envio
+    e, se der erro temporario de rede, o programa tenta de novo
+    automaticamente (ate 3 tentativas, com espera progressiva).
+  - Os uploads rodam no maximo 2 em paralelo, pra nao saturar
+    a conexao e evitar novos timeouts.
+  - Quando falha mesmo assim, a mensagem fica clara: informa
+    quantos audios falharam e o motivo (ex: timeout), em vez
+    de erro tecnico confuso.
+  - Audios ja transcritos com sucesso continuam sendo
+    aproveitados pelo cache — voce nao perde o progresso.
+
+────────────────────────────────────────────────────────────────
+  VERSÃO 2.4 (15/04/2026)
+────────────────────────────────────────────────────────────────
+
+NOVIDADES:
+
+  Renomeador de cenas mais pratico
+  - Agora voce seleciona os VIDEOS diretamente, em vez de
+    apontar a pasta inteira
+  - So aparecem formatos compativeis com a IA (mp4, mov, avi,
+    mpeg, webm, wmv, flv, 3gp) — o programa ja filtra os
+    arquivos que podem ser analisados
+  - Da pra selecionar varios de uma vez
+  - Um resumo aparece ao lado do campo: "3 arquivos: cena1.mp4,
+    cena2.mov..."
+
+  Ajustes padrao do renomeador
+  - "Frases por item" comeca em 2
+  - "Repeticoes" comeca em 2
+  - "Permitir repetir cena" vem marcado por padrao
+  - Voce so precisa mexer se quiser resultado diferente
+
+  Atualizacao automatica com log detalhado
+  - Na hora de instalar a atualizacao, voce agora ve o progresso
+    passo a passo (inclusive o que o programa esta copiando)
+  - Se der algum erro, a janela fica aberta mostrando o motivo
+    em vermelho e um botao "Fechar" pra voce ver com calma
+  - Um arquivo de log e salvo automaticamente pra analise caso
+    precise
+
+  Titulo e "Sobre" sempre corretos
+  - O titulo da janela e a tela "Sobre" agora refletem a versao
+    real do programa em tempo real (nao mais fixados em uma
+    versao antiga)
+
+CORRECOES:
+
+  Atualizacao em loop corrigida
+  - Antes, em alguns casos o programa baixava a atualizacao
+    toda vez que abria, mesmo ja estando atualizado. Isso
+    acabou.
+
+  Instalacao travando em "Instalando atualizacao..."
+  - Em determinadas situacoes, o app antigo nao fechava sozinho
+    antes da copia dos arquivos, e a instalacao ficava travada.
+    Agora ele encerra de forma garantida antes de instalar a
+    nova versao.
+
+  Tela preta piscando durante o renomeador
+  - Ao processar cenas no Renomeador, janelas de console pretas
+    apareciam rapidamente durante as operacoes. Agora tudo roda
+    em silencio sem poluir a tela.
+
+  Erros cosmeticos ao fechar janelas
+  - Fechar a janela do Renomeador enquanto ainda processava
+    gerava erros no log. Agora o programa detecta e ignora
+    silenciosamente essas situacoes.
+
+  Notas de atualizacao nao encontradas
+  - No programa compilado, a tela de notas mostrava "Arquivo
+    de notas nao encontrado". Corrigido — agora le sempre do
+    lugar certo.
+
+  Menu Configuracoes renomeado
+  - O item "Configuracoes" virou "Credenciais" pra ficar claro
+    do que se trata (nao tem mais campos editaveis — so
+    mostra status das chaves que vem do servidor)
+
+────────────────────────────────────────────────────────────────
+  VERSÃO 2.1 (13/04/2026)
+────────────────────────────────────────────────────────────────
+
+NOVIDADES:
+
+  Login de usuario
+  - Agora voce entra no programa com seu usuario e chave
+  - Da segunda vez em diante o programa ja entra sozinho
+  - Tela de login com visual mais bonito e moderno
+
+  Atualizacao automatica
+  - Quando abrir o programa, ele verifica se ha uma versao nova
+  - Se houver, baixa e instala sozinho — voce so espera terminar
+  - Em seguida o programa reinicia ja na versao atualizada
+
+  Suas chaves de servicos vem prontas
+  - Voce nao precisa mais colar chaves de OpenAI, AssemblyAI
+    nem Gemini nas configuracoes
+  - O sistema fornece as chaves automaticamente para o seu
+    usuario, ja liberadas
+  - As chaves nao ficam guardadas no seu computador
+    (mais seguro)
+
+  Tela de Credenciais (no menu "Opcoes")
+  - Mostra se cada servico (OpenAI, AssemblyAI, Gemini) esta
+    disponivel para voce no momento
+  - Botao "Atualizar status" verifica de novo, sem travar
+    o programa
+  - Se algum servico estiver com problema, da pra tentar
+    novamente direto pelo botao
+  - Se algo estiver indisponivel quando voce abrir o programa,
+    essa tela aparece automaticamente avisando qual servico
+    esta com problema
+  - Enquanto houver pendencia, voce nao consegue sair dessa
+    tela (assim voce nao usa o programa em meio passo)
+
+  Botao "Sair" para deslogar
+  - Novo botao na barra superior do programa
+  - Tambem aparece dentro da tela de Credenciais
+    (util se quiser trocar de usuario)
+  - Ao clicar, sua sessao e encerrada e voce volta pra tela
+    de login
+  - Os campos "usuario" e "chave" ja vem preenchidos com
+    o ultimo login, basta clicar em "Entrar" pra voltar
+
+────────────────────────────────────────────────────────────────
   VERSÃO 2.0 (04/04/2026)
 ────────────────────────────────────────────────────────────────
 
 NOVIDADES:
 
   Editor de Estilos para Frases Impactantes
-  - Personalize cor da fonte, cor da borda, largura, sombra
-  - Animações: Fade e Pop com duração configurável (%)
-  - CAPS LOCK, posição (Topo/Centro/Baixo), tamanho da fonte
-  - Preview em tempo real e Preview 1080p
-  - Salve e carregue estilos personalizados
+  - Personalize cor da fonte, cor da borda e largura da borda
+  - Adicione sombra com posicao e intensidade ajustaveis
+  - Animacoes de entrada e saida (Aparecer e Pop)
+  - Letras em CAIXA ALTA, escolha de posicao na tela
+    (topo, centro ou baixo) e tamanho da fonte
+  - Veja o resultado em tempo real e em qualidade Full HD
+  - Salve seus estilos favoritos e use quando quiser
 
-  Frases Impactantes com Canal Alpha
-  - Vídeos renderizados com transparência real (sem modo Tela)
-  - Frases completas até o ponto final (sem cortar no meio)
-  - Modo Frase e modo Palavra por palavra
+  Frases Impactantes com fundo transparente
+  - As frases agora aparecem com transparencia de verdade,
+    sem aquele fundo cinza esquisito
+  - Frases completas ate o ponto final (nao corta no meio)
+  - Escolha entre exibir a frase inteira ou palavra por palavra
 
-  Cache de Frases
-  - Opção "Usar cache" para reutilizar frases sem chamar a IA
-  - Economiza tempo e custo de API nas re-execuções
+  Reaproveite frases ja geradas
+  - Opcao "Usar cache" reaproveita frases criadas em execucoes
+    anteriores
+  - Economiza tempo e custo nas re-execucoes do mesmo projeto
 
-  Mixer de Áudio Completo
-  - Controle de volume para Cenas (A1), Narração (A2),
-    Inscreva-se (A3) e Música (A5)
-  - Valores em dB aplicados corretamente no Premiere
+  Mixer de audio completo
+  - Controle separado de volume para o audio das cenas,
+    da narracao, do "Inscreva-se" e da musica
+  - Os volumes sao aplicados corretamente no Premiere
 
-  Renomeador de Cenas Avançado
-  - Palavras no nome: controle quantas palavras no arquivo
-  - Frases por item: agrupe frases do roteiro
-  - Repetições: permita a mesma cena em várias frases
-  - Reprocessar Pendências: tente novamente frases sem cena
-  - Desfazer Última: reverta a cópia de arquivos
-  - Auto-seleção da próxima frase sem cena
-  - Carregamento progressivo (sem travamento)
-  - Thumbnails em 16:9
+  Renomeador de cenas mais poderoso
+  - Escolha quantas palavras vao no nome de cada arquivo
+  - Agrupe varias frases do roteiro em um unico item
+  - Permita que a mesma cena seja usada em mais de uma frase
+  - Botao para tentar de novo as frases que ficaram sem cena
+  - Botao "Desfazer Ultima" reverte a copia de arquivos
+  - O programa ja seleciona automaticamente a proxima frase
+    pendente
+  - Carregamento mais rapido (sem travar) e miniaturas em
+    formato widescreen
 
 MELHORIAS DE PERFORMANCE:
 
-  - Frases renderizadas em paralelo com a montagem de cenas
-  - Overlay e Logo com cache inteligente (não re-renderiza)
-  - Importação única de arquivos (sem duplicação)
-  - Logo proporcional à resolução da sequência
+  - As frases sao geradas em paralelo enquanto as cenas vao
+    sendo montadas — bem mais rapido
+  - Overlay e Logo nao precisam ser recriados toda vez
+  - Importacao de arquivos sem duplicacoes
+  - O logo se ajusta automaticamente a resolucao do video
 
 MELHORIAS DE INTERFACE:
 
-  - Auto-verificação do Premiere ao abrir (pula tela inicial)
-  - Botão Renomear Cenas disponível na tela inicial
-  - Tooltips (?) explicativos em todos os controles
-  - Indicadores de renderização (Verde/Vermelho) no Logo e Overlay
-  - Log completo de configurações ao exportar
-  - Console sem janelas piscando (FFmpeg silencioso)
+  - O programa ja verifica o Premiere assim que abre
+    (pula a tela de aviso quando esta tudo certo)
+  - Botao Renomear Cenas disponivel ja na tela inicial
+  - Pequenos icones de ajuda (?) explicam cada opcao
+  - Indicadores verdes/vermelhos avisam se o Logo e o Overlay
+    foram preparados com sucesso
+  - Resumo das configuracoes aparece no log ao exportar
+  - Sem mais janelinhas piscando durante o processamento
 
-CORREÇÕES:
+CORRECOES:
 
-  - Volume -999 no Premiere corrigido (conversão dB para linear)
-  - Navegação Configurações voltava para tela errada
-  - Sequência não criada mostrava erro genérico
-  - Frases impactantes travavam com segmentos gigantes
+  - Volume em valores extremos nao quebra mais o Premiere
+  - Voltar das Configuracoes agora leva pra tela certa
+  - Mensagem de erro mais clara quando a sequencia nao foi
+    criada
+  - Frases muito longas nao travam mais a geracao
 
 ────────────────────────────────────────────────────────────────
   VERSÃO 1.0 (03/04/2026)
 ────────────────────────────────────────────────────────────────
 
-  - Versão inicial do Automatizador do Premiere
-  - Montagem automática de timeline (narração + cenas + música)
-  - Transcrição com AssemblyAI
-  - Casamento semântico cena/fala via OpenAI
-  - Zoom e Fade automáticos
-  - Overlay e Logo com renderização FFmpeg
-  - CTA Inscreva-se com Chroma Key
-  - Frases Impactantes (GPT + FFmpeg)
-  - Renomeador de Cenas integrado (Gemini + embeddings)
-  - Modo vídeo em massa (backend)
+  - Versao inicial do Automatizador do Premiere
+  - Montagem automatica de timeline com narracao, cenas e musica
+  - Transcricao automatica das narracoes
+  - Casamento inteligente entre o que e dito e a cena exibida
+  - Zoom e Fade automaticos
+  - Suporte a Overlay e Logo
+  - Animacao "Inscreva-se" com remocao de fundo verde
+  - Frases impactantes geradas automaticamente
+  - Renomeador de cenas integrado
 
 ================================================================

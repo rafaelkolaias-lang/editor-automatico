@@ -2,7 +2,7 @@
 Tela de Casamento de Cenas com Feedback Visual.
 
 Fluxo:
-1. Usuário seleciona pasta de cenas + arquivo de roteiro + pasta de saída.
+1. Usuário seleciona arquivos de cenas (videos suportados pelo Gemini) + arquivo de roteiro + pasta de saída.
 2. Clica em [Processar] → SceneRenamerManager roda em thread (Gemini + embeddings).
 3. Tela transita para revisão: split-screen Listbox (esquerda) x Cards (direita).
 4. Usuário revisa, faz ajustes manuais, clica [Aplicar Cópia de Arquivos].
@@ -39,6 +39,11 @@ from ...managers.SettingsManager import SettingsManager
 _UI_CACHE_KEY = "renamer_ui"
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+
+# Formatos de video que o Gemini aceita nativamente.
+# Fonte: https://ai.google.dev/gemini-api/docs/vision
+GEMINI_VIDEO_EXTS = {".mp4", ".mpeg", ".mpg", ".mov", ".avi", ".flv",
+                     ".webm", ".wmv", ".3gp", ".3gpp"}
 CARD_MIN_WIDTH = 260
 THUMB_W, THUMB_H = 240, 135  # 16:9
 SEM_CENA_LABEL = "⚠ SEM CENA"
@@ -92,6 +97,22 @@ def _listar_cenas(pasta: Path) -> tuple[dict, list]:
             if ext in VIDEO_EXTS or ext in IMAGE_EXTS:
                 nome = Path(f).stem
                 mapa[nome] = Path(root) / f
+    nomes = sorted(mapa.keys())
+    return mapa, nomes
+
+
+def _listar_cenas_arquivos(paths: list[str]) -> tuple[dict, list]:
+    """Retorna (mapa nome→Path, lista de nomes) a partir de uma lista de arquivos."""
+    mapa: dict[str, Path] = {}
+    for p in paths:
+        path_obj = Path(p)
+        if not path_obj.is_file():
+            continue
+        ext = path_obj.suffix.lower()
+        if ext not in GEMINI_VIDEO_EXTS and ext not in IMAGE_EXTS:
+            continue
+        nome = path_obj.stem
+        mapa[nome] = path_obj
     nomes = sorted(mapa.keys())
     return mapa, nomes
 
@@ -162,14 +183,23 @@ class RenamerFeedbackScreen:
                  text="Selecione os arquivos e processe o casamento semântico antes de revisar.",
                  wraplength=800).pack(anchor="w", pady=(0, 10))
 
-        # Pasta de cenas
+        # Arquivos de cenas (vídeos suportados pelo Gemini)
         row_cenas = tk.Frame(self._setup_frame)
         row_cenas.pack(fill="x", pady=3)
-        tk.Label(row_cenas, text="Pasta de cenas:", width=18, anchor="w").pack(side="left")
+        tk.Label(row_cenas, text="Arquivos de cenas:", width=18, anchor="w").pack(side="left")
         self._cenas_var = tk.StringVar()
+        self._cenas_var.trace_add("write", lambda *_: self._refresh_cenas_info())
         tk.Entry(row_cenas, textvariable=self._cenas_var, width=60).pack(side="left", padx=4)
         tk.Button(row_cenas, text="Escolher",
                   command=self._pick_cenas).pack(side="left")
+
+        # Label com resumo (ex: "3 arquivos selecionados" ou "pasta: /caminho")
+        row_cenas_info = tk.Frame(self._setup_frame)
+        row_cenas_info.pack(fill="x")
+        tk.Label(row_cenas_info, text="", width=18).pack(side="left")
+        self._cenas_info_var = tk.StringVar(value="")
+        tk.Label(row_cenas_info, textvariable=self._cenas_info_var,
+                 fg="#0078D7", anchor="w").pack(side="left", fill="x", expand=True)
 
         # Arquivo de roteiro
         row_rot = tk.Frame(self._setup_frame)
@@ -198,7 +228,7 @@ class RenamerFeedbackScreen:
         self._include_audio_var = tk.IntVar(value=1)
         tk.Checkbutton(row_opts, text="Incluir áudio do vídeo na análise",
                        variable=self._include_audio_var).pack(side="left", padx=10)
-        self._allow_reuse_var = tk.IntVar(value=0)
+        self._allow_reuse_var = tk.IntVar(value=1)
         tk.Checkbutton(row_opts, text="Permitir repetir cena",
                        variable=self._allow_reuse_var).pack(side="left", padx=10)
 
@@ -221,12 +251,12 @@ class RenamerFeedbackScreen:
                             "Quantas palavras da frase serão usadas\npara nomear o arquivo copiado.\nEx: 6 = primeiras 6 palavras.",
                             self._n_words_var, 2, 20)
 
-        self._sentences_per_chunk_var = tk.IntVar(value=1)
+        self._sentences_per_chunk_var = tk.IntVar(value=2)
         _add_field_with_tip(row_opts2, "Frases por item:",
                             "Agrupa N frases do roteiro em 1 item\npara o casamento com cenas.\n1 = cada frase vira 1 item.\n2 = cada 2 frases viram 1 item.",
                             self._sentences_per_chunk_var, 1, 5)
 
-        self._max_uses_var = tk.IntVar(value=1)
+        self._max_uses_var = tk.IntVar(value=2)
         _add_field_with_tip(row_opts2, "Repetições:",
                             "Quantas vezes a mesma cena pode ser\nusada em frases diferentes.\n1 = cada cena usada 1 vez.\n3 = mesma cena pode aparecer em até 3 frases.",
                             self._max_uses_var, 1, 10)
@@ -282,7 +312,14 @@ class RenamerFeedbackScreen:
 
     def _load_ui_cache(self):
         try:
-            cfg = self.settings_manager.read_settings().get(_UI_CACHE_KEY) or {}
+            settings = self.settings_manager.read_settings()
+            cfg = settings.get(_UI_CACHE_KEY) or {}
+            sp = getattr(self.settings_manager, 'SETTINGS_PATH', '?')
+            if cfg:
+                self._log(f"Config anterior carregada de: {sp}")
+            else:
+                self._log(f"Nenhuma config anterior encontrada em: {sp}")
+
             if cfg.get("cenas_dir"):
                 self._cenas_var.set(cfg["cenas_dir"])
             if cfg.get("roteiro_file"):
@@ -301,8 +338,11 @@ class RenamerFeedbackScreen:
                 self._sentences_per_chunk_var.set(int(cfg["sentences_per_chunk"]))
             if "max_uses" in cfg:
                 self._max_uses_var.set(int(cfg["max_uses"]))
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                self._log(f"[ERRO] Falha ao carregar config anterior: {e}")
+            except Exception:
+                pass
 
     def _save_ui_cache(self):
         try:
@@ -322,11 +362,62 @@ class RenamerFeedbackScreen:
         except Exception:
             pass
 
+    def _refresh_cenas_info(self):
+        """Mostra um resumo amigavel ao lado do campo de cenas."""
+        try:
+            raw = self._cenas_var.get().strip()
+            if not raw:
+                self._cenas_info_var.set("")
+                return
+            if os.path.isdir(raw):
+                self._cenas_info_var.set(f"Pasta: {raw}")
+                return
+            files = [p for p in raw.split(";") if p.strip()]
+            if len(files) == 1:
+                self._cenas_info_var.set(f"1 arquivo: {Path(files[0]).name}")
+            elif files:
+                nomes = ", ".join(Path(p).name for p in files[:3])
+                sufixo = f" e +{len(files) - 3}" if len(files) > 3 else ""
+                self._cenas_info_var.set(f"{len(files)} arquivos: {nomes}{sufixo}")
+        except Exception:
+            pass
+
     def _pick_cenas(self):
-        d = filedialog.askdirectory(title="Selecione a pasta de cenas", parent=self.top)
-        if d:
-            self._cenas_var.set(d)
-            self._save_ui_cache()
+        # Filetypes: todos os formatos de video aceitos pelo Gemini
+        exts_gemini = " ".join(f"*{e}" for e in sorted(GEMINI_VIDEO_EXTS))
+        files = filedialog.askopenfilenames(
+            title="Selecione os arquivos de cenas (videos)",
+            filetypes=[
+                ("Videos suportados (Gemini)", exts_gemini),
+                ("Todos", "*.*"),
+            ],
+            parent=self.top)
+        if not files:
+            return
+
+        # Filtra por extensao compativel (caso o usuario escolha via "Todos")
+        aceitos = []
+        rejeitados = []
+        for f in files:
+            if Path(f).suffix.lower() in GEMINI_VIDEO_EXTS:
+                aceitos.append(f)
+            else:
+                rejeitados.append(Path(f).name)
+
+        if rejeitados:
+            messagebox.showwarning(
+                "Arquivos ignorados",
+                "Estes arquivos nao sao suportados pelo Gemini e serao ignorados:\n\n"
+                + "\n".join(rejeitados[:10])
+                + ("\n..." if len(rejeitados) > 10 else ""),
+                parent=self.top)
+
+        if not aceitos:
+            return
+
+        # Armazena como string separada por ';' (compativel com StringVar)
+        self._cenas_var.set(";".join(aceitos))
+        self._save_ui_cache()
 
     def _pick_roteiro(self):
         f = filedialog.askopenfilename(
@@ -346,28 +437,58 @@ class RenamerFeedbackScreen:
     # ---------- processamento ----------
 
     def _start_processing(self):
-        cenas_dir = self._cenas_var.get().strip()
+        cenas_raw = self._cenas_var.get().strip()
         roteiro_file = self._roteiro_var.get().strip()
 
-        if not cenas_dir or not os.path.isdir(cenas_dir):
-            messagebox.showerror("Erro", "Selecione uma pasta de cenas válida.", parent=self.top)
-            return
-        if not roteiro_file or not os.path.isfile(roteiro_file):
-            messagebox.showerror("Erro", "Selecione um arquivo de roteiro válido.", parent=self.top)
+        if not cenas_raw:
+            messagebox.showerror("Erro", "Selecione os arquivos de cenas.", parent=self.top)
             return
 
-        settings = self.settings_manager.read_settings()
-        gemini_key = (settings.get("env") or {}).get("GEMINI_API_KEY", "")
-        if not gemini_key:
-            # fallback: pede ao usuário
-            from tkinter import simpledialog
-            gemini_key = simpledialog.askstring(
-                "Chave Gemini", "Informe sua chave da API Gemini:", parent=self.top)
-            if not gemini_key:
+        # Pode ser: uma pasta (legado) OU uma lista de arquivos separada por ';'
+        cenas_is_dir = os.path.isdir(cenas_raw)
+        cenas_files: list[str] = []
+        if cenas_is_dir:
+            # Compatibilidade retroativa: ainda aceita pasta
+            cenas_dir = cenas_raw
+        else:
+            cenas_files = [p for p in cenas_raw.split(";") if p.strip()]
+            faltando = [p for p in cenas_files if not os.path.isfile(p)]
+            if faltando:
+                messagebox.showerror(
+                    "Erro",
+                    "Estes arquivos nao existem mais:\n\n"
+                    + "\n".join(faltando[:10])
+                    + ("\n..." if len(faltando) > 10 else "")
+                    + "\n\nSelecione os arquivos novamente.",
+                    parent=self.top)
                 return
-            # salva para não pedir de novo
-            settings.setdefault("env", {})["GEMINI_API_KEY"] = gemini_key
-            self.settings_manager.write_settings(settings)
+            if not cenas_files:
+                messagebox.showerror(
+                    "Erro",
+                    f"Nao foi possivel interpretar a selecao:\n{cenas_raw}\n\nSelecione os arquivos de cenas.",
+                    parent=self.top)
+                return
+            # Primeiro arquivo define o diretorio base usado internamente (logs/caches)
+            cenas_dir = str(Path(cenas_files[0]).parent)
+        if not roteiro_file:
+            messagebox.showerror("Erro", "Selecione um arquivo de roteiro.", parent=self.top)
+            return
+        if not os.path.isfile(roteiro_file):
+            messagebox.showerror(
+                "Erro",
+                f"O arquivo de roteiro nao existe mais:\n{roteiro_file}\n\nEscolha um arquivo valido.",
+                parent=self.top)
+            return
+
+        from core.remote_credentials import get_api_key
+        gemini_key = get_api_key("GEMINI_API_KEY")
+        if not gemini_key:
+            messagebox.showerror(
+                "Credencial Gemini indisponivel",
+                "Nao foi possivel obter a chave Gemini do servidor. "
+                "Verifique seu login e tente novamente.",
+                parent=self.top)
+            return
 
         try:
             with open(roteiro_file, "r", encoding="utf-8") as fh:
@@ -376,10 +497,13 @@ class RenamerFeedbackScreen:
             messagebox.showerror("Erro ao ler roteiro", str(e), parent=self.top)
             return
 
-        # carrega cenas
-        self._scene_paths, self._scene_names = _listar_cenas(Path(cenas_dir))
+        # carrega cenas (lista de arquivos selecionados ou pasta legada)
+        if cenas_is_dir:
+            self._scene_paths, self._scene_names = _listar_cenas(Path(cenas_dir))
+        else:
+            self._scene_paths, self._scene_names = _listar_cenas_arquivos(cenas_files)
         if not self._scene_names:
-            messagebox.showerror("Erro", "Nenhuma mídia encontrada na pasta de cenas.", parent=self.top)
+            messagebox.showerror("Erro", "Nenhuma cena suportada foi encontrada.", parent=self.top)
             return
 
         self._log(f"Cenas encontradas: {len(self._scene_names)}")
@@ -400,7 +524,12 @@ class RenamerFeedbackScreen:
 
     def _processing_worker(self, gemini_key: str, roteiro_text: str, cenas_dir: str):
         try:
-            from ...managers.SceneRenamerManager import SceneRenamerManager, ProcessingCancelled
+            from ...managers.SceneRenamerManager import (
+                SceneRenamerManager,
+                ProcessingCancelled,
+                QuotaExhaustedError,
+                _is_rate_limit_error,
+            )
             from ...utils.renamer_utils import build_script_items
         except ImportError as e:
             self._log(f"[ERRO] Não foi possível importar SceneRenamerManager: {e}")
@@ -408,6 +537,10 @@ class RenamerFeedbackScreen:
             self.top.after(0, lambda: self._btn_processar.config(state="normal"))
             self.top.after(0, lambda: self._btn_cancelar.config(state="disabled"))
             return
+
+        script_items = None
+        scene_descs = None
+        manager = None
 
         try:
             manager = SceneRenamerManager(
@@ -441,31 +574,53 @@ class RenamerFeedbackScreen:
             if self._stop_event.is_set():
                 raise ProcessingCancelled("Cancelado pelo usuário.")
 
+            # Preserva o estado de descricao antes do matching — assim, se a
+            # etapa seguinte cair por rate limit, o usuario consegue reprocessar
+            # sem precisar redescrever tudo do zero.
+            self._last_script_items = script_items
+            self._last_scene_descs = scene_descs
+            self._last_manager = manager
+            self._assignments = [
+                {
+                    "index": i,
+                    "script_fragment": phrase,
+                    "assigned_scene": None,
+                }
+                for i, phrase in enumerate(script_items)
+            ]
+
             # 3. Matching semântico
             max_uses = max(1, self._max_uses_var.get()) if self._allow_reuse_var.get() else 1
             self._log(f"Calculando casamento semântico (max_usos/cena={max_uses})...")
-            assignments_result = manager.compute_assignments(
-                script_items=script_items,
-                scene_descs=scene_descs,
-                max_uses_per_scene=max_uses,
-            )
+            try:
+                assignments_result = manager.compute_assignments(
+                    script_items=script_items,
+                    scene_descs=scene_descs,
+                    max_uses_per_scene=max_uses,
+                )
+            except QuotaExhaustedError as qe:
+                self._log("")
+                self._log("[RATE LIMIT] O Gemini recusou mais embeddings por cota/limite temporario.")
+                self._log("             As descricoes das cenas ja foram preservadas no cache local.")
+                self._log("             Aguarde alguns minutos e use 'Reprocessar Pendencias' para tentar o")
+                self._log("             casamento de novo — o trabalho anterior NAO sera perdido.")
+                self._log(f"             Detalhe: {qe}")
+                self._progress_var.set(55)
+                # Habilita revisao parcial (frases sem cena) e o botao de reprocess
+                self.top.after(0, lambda: self._btn_revisar.config(state="normal"))
+                return
             # compute_assignments devolve (List[Assignment], Set[int], Set[int])
             assignments_list = assignments_result[0] if isinstance(assignments_result, tuple) else assignments_result
             self._progress_var.set(90)
 
-            # 4. Monta estrutura de revisão
-            self._assignments = []
-            for i, phrase in enumerate(script_items):
+            # 4. Preenche cenas atribuidas sobre o esqueleto criado acima
+            for i in range(len(script_items)):
                 assigned = None
                 for asn in assignments_list:
                     if asn.phrase_idx == i:
                         assigned = self._scene_names[asn.scene_idx] if asn.scene_idx < len(self._scene_names) else None
                         break
-                self._assignments.append({
-                    "index": i,
-                    "script_fragment": phrase,
-                    "assigned_scene": assigned,
-                })
+                self._assignments[i]["assigned_scene"] = assigned
 
             self._progress_var.set(100)
             matched = sum(1 for a in self._assignments if a['assigned_scene'])
@@ -474,22 +629,40 @@ class RenamerFeedbackScreen:
             if pending > 0:
                 self._log(f"[PENDENTE] {pending} frase(s) sem cena. Use 'Reprocessar Pendências' para tentar novamente.")
 
-            # Salvar estado para reprocessamento
-            self._last_script_items = script_items
-            self._last_scene_descs = scene_descs
-            self._last_manager = manager
-
             self.top.after(0, lambda: self._btn_revisar.config(state="normal"))
 
         except ProcessingCancelled:
             self._log("Processamento cancelado.")
         except Exception as e:
-            self._log(f"[ERRO] {e}")
-            import traceback
-            self._log(traceback.format_exc())
+            if _is_rate_limit_error(e):
+                self._log("")
+                self._log("[RATE LIMIT] Gemini temporariamente sem cota para esta operacao.")
+                self._log("             Aguarde alguns minutos e tente novamente.")
+                if scene_descs:
+                    self._log("             As descricoes ja geradas estao no cache — nada sera redescrito.")
+                self._log(f"             Detalhe: {e}")
+                if scene_descs:
+                    self.top.after(0, lambda: self._btn_revisar.config(state="normal"))
+            else:
+                self._log(f"[ERRO] {e}")
+                import traceback
+                self._log(traceback.format_exc())
         finally:
-            self.top.after(0, lambda: self._btn_processar.config(state="normal"))
-            self.top.after(0, lambda: self._btn_cancelar.config(state="disabled"))
+            # Guard: a janela Toplevel pode ter sido fechada enquanto o worker
+            # estava processando — nesse caso, pular o reset dos botoes.
+            def _reset_buttons():
+                try:
+                    if self._btn_processar.winfo_exists():
+                        self._btn_processar.config(state="normal")
+                    if self._btn_cancelar.winfo_exists():
+                        self._btn_cancelar.config(state="disabled")
+                except Exception:
+                    pass
+            try:
+                if self.top.winfo_exists():
+                    self.top.after(0, _reset_buttons)
+            except Exception:
+                pass
 
     def _cancel_processing(self):
         self._stop_event.set()

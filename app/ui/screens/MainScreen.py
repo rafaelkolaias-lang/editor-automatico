@@ -12,6 +12,8 @@ from ...entities import Part
 from ...entities import EXTENSIONS
 from ..components import SelectComponent
 from ...managers import ConversionManager, DirectoriesManager, PremiereManager, SettingsManager, TranscriptionManager
+from ...managers.SettingsManager import get_runtime_root
+from ...__version__ import VERSAO
 
 
 class _Tip:
@@ -49,16 +51,14 @@ def _tip_label(parent, tip_text: str):
 
 
 def _show_release_notes(parent):
-    """Abre janela com notas de atualização."""
-    notes_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
-        "assets", "release_notes.txt"
-    )
+    """Abre janela com notas de atualizacao. Resolve o path compativel com
+    PyInstaller (ao lado do exe) e com modo dev (raiz do projeto)."""
+    notes_path = os.path.join(get_runtime_root(), "assets", "release_notes.txt")
     try:
         with open(notes_path, "r", encoding="utf-8") as f:
             content = f.read()
-    except Exception:
-        content = "Arquivo de notas não encontrado."
+    except Exception as e:
+        content = f"Arquivo de notas nao encontrado.\n\nPath tentado:\n{notes_path}\n\nErro: {e}"
 
     win = tk.Toplevel(parent)
     win.title("Notas de Atualização")
@@ -83,6 +83,7 @@ class MainScreen:
     transcription_manager: TranscriptionManager = None
 
     on_open_settings: Callable[[], None] = None
+    on_logout: Callable[[], None] = None
     on_working: Callable[[], None] = None
     on_working_done: Callable[[], None] = None
 
@@ -99,6 +100,7 @@ class MainScreen:
     max_zoom_entry: tk.Entry = None
 
     def __init__(self, app: tk.Tk):
+        self._app = app
         self.widget = tk.Frame(app)
 
         # Garante que exista mesmo se o checkbox não tiver sido criado ainda
@@ -113,14 +115,14 @@ class MainScreen:
         if not isinstance(ui_cache, dict):
             ui_cache = {}
 
-        API_KEY = (settings.get('env') or {}).get('ASSEMBLY_AI_KEY')
-        self.transcription_manager = TranscriptionManager(API_KEY)
+        # Credenciais vem do servidor sob demanda (manual-credenciais).
+        self.transcription_manager = TranscriptionManager()
 
         # ========== MENU SUPERIOR ==========
         self.mode_var = tk.StringVar(value='transcription')
         menubar = tk.Menu(app)
         menu_opcoes = tk.Menu(menubar, tearoff=0)
-        menu_opcoes.add_command(label='Configuracoes', command=lambda: self.on_open_settings())
+        menu_opcoes.add_command(label='Credenciais', command=lambda: self.on_open_settings())
         menu_opcoes.add_separator()
 
         def _show_terminal():
@@ -134,10 +136,16 @@ class MainScreen:
         menu_ajuda = tk.Menu(menubar, tearoff=0)
         menu_ajuda.add_command(label='Notas de Atualização', command=lambda: _show_release_notes(app))
         menu_ajuda.add_command(label='Sobre', command=lambda: messagebox.showinfo(
-            'Sobre', 'Automatizador do Premiere 2.0\nDesenvolvido por Kolaias', parent=app))
+            'Sobre', f'Automatizador do Premiere {VERSAO}\nDesenvolvido por Kolaias', parent=app))
         menubar.add_cascade(label='Ajuda', menu=menu_ajuda)
 
-        app.config(menu=menubar)
+        # "Sair" direto na barra (sem submenu)
+        menubar.add_command(label='Sair',
+                            command=lambda: self.on_logout() if self.on_logout else None)
+
+        # Guarda referencia; aplicacao acontece no render() para nao
+        # vazar o menu para outras telas (ex.: InitialScreen tem menu proprio).
+        self._menubar = menubar
 
         # Parent direto para conteudo do editor
         ep = self.widget
@@ -742,7 +750,7 @@ class MainScreen:
                     return
 
                 paralell_work = Thread(target=self.get_premiere_worker(
-                    callback=on_export_project_done))
+                    callback=on_export_project_done), daemon=True)
                 paralell_work.start()
                 self.on_working()
             except Exception as error:
@@ -786,7 +794,8 @@ class MainScreen:
                     return
 
                 paralell_work = Thread(
-                    target=self.get_premiere_worker(callback=on_export_xml_done))
+                    target=self.get_premiere_worker(callback=on_export_xml_done),
+                    daemon=True)
                 paralell_work.start()
                 self.on_working()
             except Exception as error:
@@ -1397,17 +1406,16 @@ class MainScreen:
                                  'Por favor, selecione um estilo de música.')
             return False
 
-        # Se frases impactantes estiverem ligadas, exige chave OpenAI
+        # Se frases impactantes estiverem ligadas, exige credencial OpenAI remota
         try:
             impact_cfg = self.get_impact_config()
             if impact_cfg.get("enabled"):
-                settings = self.settings_manager.read_settings()
-                openai_key = (settings.get("env", {}) or {}
-                              ).get("OPENAI_API_KEY", "")
-                if not openai_key:
+                from core.remote_credentials import get_api_key
+                if not get_api_key('OPENAI_API_KEY'):
                     messagebox.showerror(
-                        'Chave OpenAI ausente',
-                        'Você ativou "Frases impactantes (GPT)", mas a chave OPENAI_API_KEY não está preenchida nas Configurações.'
+                        'Credencial OpenAI indisponivel',
+                        'Frases impactantes (GPT) exigem a credencial OpenAI do servidor. '
+                        'Verifique seu login e a conexao, e tente novamente.'
                     )
                     return False
         except Exception:
@@ -1768,13 +1776,9 @@ class MainScreen:
                 self.on_working_done()
                 return
 
-            # Lê chave OpenAI antes do loop de casamento para usar o método LLM
-            try:
-                _settings_pre = self.settings_manager.read_settings()
-                _openai_key_pre = (_settings_pre.get('env', {}) or {}).get('OPENAI_API_KEY', '')
-            except Exception:
-                _openai_key_pre = ''
-            self.transcription_manager.set_openai_api_key(_openai_key_pre)
+            # Credencial OpenAI vem sob demanda do servidor (property).
+            # set_openai_api_key agora e no-op, chamada preservada por legado.
+            self.transcription_manager.set_openai_api_key('')
 
             narrations_map: dict[str, list[Part]] = {}
             for narration_index, narration_transcription in enumerate(narrations_transcriptions_result.data):
@@ -1798,9 +1802,8 @@ class MainScreen:
                 impact_cfg = {"enabled": False}
 
             try:
-                settings = self.settings_manager.read_settings()
-                openai_key = (settings.get('env', {}) or {}
-                              ).get('OPENAI_API_KEY', '')
+                from core.remote_credentials import get_api_key
+                openai_key = get_api_key('OPENAI_API_KEY')
             except Exception:
                 openai_key = ''
 
@@ -2076,11 +2079,11 @@ class MainScreen:
         return False
 
     def render(self):
-        settings = self.settings_manager.read_settings()
-        API_KEY = settings.get('env').get('ASSEMBLY_AI_KEY')
-
-        self.transcription_manager.set_api_key(API_KEY)
-
+        # Credencial AssemblyAI resolvida sob demanda via property.
+        try:
+            self._app.config(menu=self._menubar)
+        except Exception:
+            pass
         self.widget.pack(expand=True)
 
     def unrender(self):

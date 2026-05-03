@@ -86,6 +86,21 @@ class TerminalPopup:
         if self._window and self._window.winfo_exists():
             self._window.withdraw()
 
+    def close(self):
+        """Restaura stdout/stderr e destroi a janela. Usado no shutdown do app."""
+        try:
+            sys.stdout = self._original_stdout
+            sys.stderr = self._original_stderr
+        except Exception:
+            pass
+        try:
+            if self._window and self._window.winfo_exists():
+                self._window.destroy()
+        except Exception:
+            pass
+        self._window = None
+        self._text = None
+
     def _clear(self):
         if self._text:
             self._text.configure(state='normal')
