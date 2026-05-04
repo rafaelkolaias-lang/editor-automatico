@@ -518,22 +518,22 @@ class MainScreen:
 
         vcmd_db = (self.widget.register(_validate_db), '%P')
 
-        tk.Label(mixer_frame, text='Cenas (A1):').pack(side='left')
+        tk.Label(mixer_frame, text='Cenas (A1+A2):').pack(side='left')
         self.vol_scene_entry = tk.Entry(mixer_frame, width=5, validate='key', validatecommand=vcmd_db)
         self.vol_scene_entry.insert(0, str(ui_cache.get("vol_scene", -99)))
         self.vol_scene_entry.pack(side='left', padx=(0, 12))
 
-        tk.Label(mixer_frame, text='Narracao (A2):').pack(side='left')
+        tk.Label(mixer_frame, text='Narracao (A3):').pack(side='left')
         self.vol_narration_entry = tk.Entry(mixer_frame, width=5, validate='key', validatecommand=vcmd_db)
         self.vol_narration_entry.insert(0, str(ui_cache.get("vol_narration", 0)))
         self.vol_narration_entry.pack(side='left', padx=(0, 12))
 
-        tk.Label(mixer_frame, text='Inscreva-se (A3):').pack(side='left')
+        tk.Label(mixer_frame, text='Inscreva-se (A4):').pack(side='left')
         self.vol_cta_entry = tk.Entry(mixer_frame, width=5, validate='key', validatecommand=vcmd_db)
         self.vol_cta_entry.insert(0, str(ui_cache.get("vol_cta", -9)))
         self.vol_cta_entry.pack(side='left', padx=(0, 12))
 
-        tk.Label(mixer_frame, text='Musica (A5):').pack(side='left')
+        tk.Label(mixer_frame, text='Musica (A8):').pack(side='left')
         self.vol_music_entry = tk.Entry(mixer_frame, width=5, validate='key', validatecommand=vcmd_db)
         self.vol_music_entry.insert(0, str(ui_cache.get("vol_music", -12)))
         self.vol_music_entry.pack(side='left')
@@ -1242,18 +1242,18 @@ class MainScreen:
         # -------- duplicar / preencher gaps --------
         try:
             self.dup_scenes_var.set(1 if ui_cache.get(
-                "duplicate_scenes", True) else 0)
+                "duplicate_scenes", False) else 0)
         except Exception:
             pass
 
         try:
             self.fill_gaps_var.set(1 if ui_cache.get(
-                "fill_gaps_without_scene", False) else 0)
+                "fill_gaps_without_scene", True) else 0)
         except Exception:
             pass
 
         try:
-            v = int(ui_cache.get("max_fill_scene_duration", 7))
+            v = int(ui_cache.get("max_fill_scene_duration", 12))
             self.max_fill_scene_entry.delete(0, "end")
             self.max_fill_scene_entry.insert(0, str(max(0, v)))
         except Exception:
@@ -1502,12 +1502,12 @@ class MainScreen:
             return (5, 7)
 
     def get_max_fill_scene_duration(self) -> float:
-        """Retorna dur. máx. de cena aleatória em segundos (0 = sem limite). Padrão: 7."""
+        """Retorna dur. máx. de cena aleatória em segundos (0 = sem limite). Padrão: 12."""
         try:
             v = int(self.max_fill_scene_entry.get())
             return float(max(0, v))
         except Exception:
-            return 7.0
+            return 12.0
 
     def get_fade_percentage(self) -> int:
         """Retorna a porcentagem do fade (inteiro >= 1). Padrão: 10."""
@@ -1827,11 +1827,11 @@ class MainScreen:
                 apply_fade_immediately=getattr(
                     self, 'selected_fade_live', False),
                 duplicate_scenes_until_next=getattr(
-                    self, 'selected_duplicate_scenes', True),
+                    self, 'selected_duplicate_scenes', False),
                 fill_gaps_with_random_scenes=getattr(
-                    self, 'selected_fill_gaps_without_scene', False),
+                    self, 'selected_fill_gaps_without_scene', True),
                 max_fill_scene_duration=getattr(
-                    self, 'selected_max_fill_scene_duration', 0.0),
+                    self, 'selected_max_fill_scene_duration', 12.0),
 
                 # Recursos visuais
                 logo_path=getattr(self, 'selected_logo_path', ''),

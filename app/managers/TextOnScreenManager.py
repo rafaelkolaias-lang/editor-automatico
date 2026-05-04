@@ -1173,7 +1173,7 @@ class TextOnScreenManager:
         premiere_mgr,
         overlays: List[Dict[str, Any]],
         *,
-        track_index: int = 3
+        track_index: int = 6
     ) -> Result[None]:
         """
         Insere overlays na timeline do Premiere.
@@ -1183,11 +1183,12 @@ class TextOnScreenManager:
         - A mesclagem é lida automaticamente do overlay.txt do roteiro (quando possível),
         reaproveitando o mesmo padrão do overlay principal.
 
-        Por padrão usa V3 (track_index=3) porque no seu projeto:
-        V0 = cenas
-        V1 = logo
-        V2 = overlay
-        V3 = textos (seguro p/ não sobrescrever o overlay)
+        Por padrão usa V7 (track_index=6) - frases impactantes / textos no
+        topo da pilha. Layout atual:
+        V1 = cenas coerentes  V2 = cenas filler  V3 = vazio
+        V4 = CTA  V5 = overlay  V6 = logo  V7 = textos (este).
+        Na pratica `editing.py` ja passa `mgr.IMPACT_TEXT_TRACK_INDEX`
+        explicitamente, entao este default raramente e usado.
         """
         try:
             if not overlays:

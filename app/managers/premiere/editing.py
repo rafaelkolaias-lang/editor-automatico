@@ -138,9 +138,9 @@ def mount_sequence(
     zoom_max_scale_multiplier: float,
     fade_percentage: float = 10.0,
     apply_fade_immediately: bool = False,
-    duplicate_scenes_until_next: bool = True,
-    fill_gaps_with_random_scenes: bool = False,
-    max_fill_scene_duration: float = 0.0,
+    duplicate_scenes_until_next: bool = False,
+    fill_gaps_with_random_scenes: bool = True,
+    max_fill_scene_duration: float = 12.0,
 
     narrations_transcriptions: Optional[list[Any]] = None,
     impact_phrases_config: Optional[dict] = None,
@@ -213,13 +213,14 @@ def mount_sequence(
     # addTracks insere no topo e empurra conteudo existente, entao criamos
     # todas de uma vez antes de qualquer clip para evitar deslocamento.
     _max_video_idx = max(
-        mgr.SCENE_TRACK_INDEX, mgr.CTA_TRACK_INDEX,
-        mgr.IMPACT_TEXT_TRACK_INDEX, mgr.OVERLAY_TRACK_INDEX,
-        mgr.LOGO_TRACK_INDEX
+        mgr.SCENE_TRACK_INDEX, mgr.FILLER_SCENE_TRACK_INDEX,
+        mgr.CTA_TRACK_INDEX, mgr.IMPACT_TEXT_TRACK_INDEX,
+        mgr.OVERLAY_TRACK_INDEX, mgr.LOGO_TRACK_INDEX
     )
     _max_audio_idx = max(
-        mgr.SCENE_TRACK_INDEX, mgr.NARRATION_TRACK_INDEX,
-        mgr.CTA_AUDIO_TRACK_INDEX, mgr.MUSIC_TRACK_INDEX
+        mgr.SCENE_TRACK_INDEX, mgr.FILLER_SCENE_TRACK_INDEX,
+        mgr.NARRATION_TRACK_INDEX, mgr.CTA_AUDIO_TRACK_INDEX,
+        mgr.MUSIC_TRACK_INDEX
     )
     try:
         mgr._PremiereManager__ensure_video_track_index(_max_video_idx)
@@ -409,6 +410,14 @@ def mount_sequence(
                     last_narration_end.seconds + part.start / 1000
                 )
 
+                # [scene-debug] log de cada part processada (alvo + arquivo
+                # casado pela OpenAI). Permite verificar visualmente na
+                # timeline se a cena ESPERADA esta na posicao ESPERADA.
+                print(f"[scene-debug] >>> part#{part_index:03d} narr='{narration_file}' "
+                      f"alvo_start={scene_start.seconds:.2f}s "
+                      f"part.start={part.start/1000:.2f}s "
+                      f"cena='{part.text}'")
+
                 scene_abs = os.path.join(scenes_base_path, part.text)
                 scene_path = _resolve_path(scene_abs)
                 if scene_path is None:
@@ -438,13 +447,22 @@ def mount_sequence(
                 inserted_scene_dims: list[Dimensions] = []
                 inserted_scene_clips: list = []  # referências diretas — evita list(vtrack.clips) O(N)
 
-                def _insert_scene_clip(project_item, media_path: str, start_time, max_dur: float = 0.0):
-                    nonlocal current_scene_end, scenes_repetition_count
+                # Lembra em qual track foi a ULTIMA insercao desta part.
+                # Necessario para o bloco "corte de cena excedente" saber em
+                # qual trilha cortar (V1 ou V2). Ver Item 8 do plano.
+                last_inserted_track_idx = mgr.SCENE_TRACK_INDEX
+
+                def _insert_scene_clip(project_item, media_path: str, start_time, max_dur: float = 0.0,
+                                        track_index: int = None):
+                    nonlocal current_scene_end, scenes_repetition_count, last_inserted_track_idx
+                    if track_index is None:
+                        track_index = mgr.SCENE_TRACK_INDEX
+                    last_inserted_track_idx = track_index
                     # Captura o retorno: __insert_clip_with_retry já devolve o clipe
                     # inserido via índice O(1) — elimina o fetch clips[-1] separado.
                     current_scene_clip = mgr._PremiereManager__insert_clip_with_retry(
                         track_type='video',
-                        track_index=mgr.SCENE_TRACK_INDEX,
+                        track_index=track_index,
                         project_item=project_item,
                         start_time=start_time
                     )
@@ -466,17 +484,17 @@ def mount_sequence(
                             tc = pymiere.wrappers.timecode_from_seconds(
                                 cut_at, pymiere.objects.app.project.activeSequence)
                             mgr._PremiereManager__qe_razor_with_retry(
-                                track_type='video', track_index=mgr.SCENE_TRACK_INDEX, timecode=tc)
+                                track_type='video', track_index=track_index, timecode=tc)
                             mgr._PremiereManager__qe_razor_with_retry(
-                                track_type='audio', track_index=mgr.SCENE_TRACK_INDEX, timecode=tc)
+                                track_type='audio', track_index=track_index, timecode=tc)
                             vt = pymiere.objects.app.project.activeSequence.videoTracks[
-                                mgr.SCENE_TRACK_INDEX]
+                                track_index]
                             n_razor = len(vt.clips)
                             if n_razor > 0:
                                 vt.clips[n_razor - 1].remove(False, False)
                             try:
                                 at = pymiere.objects.app.project.activeSequence.audioTracks[
-                                    mgr.SCENE_TRACK_INDEX]
+                                    track_index]
                                 a_clips = list(at.clips)
                                 if a_clips:
                                     last_a = a_clips[-1]
@@ -495,27 +513,50 @@ def mount_sequence(
                     inserted_scene_clips.append(current_scene_clip)
                     current_scene_end = current_scene_clip.end
 
+                    # [scene-debug] log da insercao real (start REQUISITADO
+                    # vs start RETORNADO pelo Premiere - ajuda detectar se
+                    # houve arredondamento/deslocamento na trilha).
+                    _track_label = ("V1-COERENTE" if track_index == mgr.SCENE_TRACK_INDEX
+                                     else f"V{track_index + 1}-FILLER")
+                    _req_s = float(getattr(start_time, 'seconds', 0.0))
+                    _real_start = float(current_scene_clip.start.seconds)
+                    _real_end = float(current_scene_clip.end.seconds)
+                    _delta = _real_start - _req_s
+                    _delta_flag = "" if abs(_delta) < 0.05 else f"  ⚠ DELTA={_delta:+.3f}s"
+                    print(f"[scene-debug]   {_track_label} "
+                          f"req={_req_s:.2f}s real={_real_start:.2f}s->"
+                          f"{_real_end:.2f}s ({_real_end - _real_start:.2f}s) "
+                          f"'{os.path.basename(media_path)}'{_delta_flag}")
+
                 # Duracao maxima para cenas principais (15-20s aleatorio)
                 MAX_MAIN_SCENE_SEC = random.uniform(15.0, 20.0)
 
                 if duplicate_scenes_until_next:
+                    # Primeira insercao = cena COERENTE casada com a part -> V1
+                    # Repeticoes (mesma cena duplicada ate next_scene_start) -> V2
+                    is_first_dup = True
                     while current_scene_end.seconds < next_scene_start.seconds:
                         prev_end = current_scene_end.seconds
+                        target_idx = (mgr.SCENE_TRACK_INDEX if is_first_dup
+                                       else mgr.FILLER_SCENE_TRACK_INDEX)
                         _insert_scene_clip(
                             imported_scene, scene_path, current_scene_end,
-                            max_dur=MAX_MAIN_SCENE_SEC)
+                            max_dur=MAX_MAIN_SCENE_SEC,
+                            track_index=target_idx)
+                        is_first_dup = False
 
                         # trava anti-loop (se o Premiere nao avancar o tempo)
                         if current_scene_end.seconds <= prev_end + 1e-6:
                             break
 
                 else:
-                    # Insere apenas 1 clipe (limita a 15-20s)
+                    # Insere apenas 1 clipe (limita a 15-20s) - cena COERENTE em V1
                     _insert_scene_clip(
                         imported_scene, scene_path, current_scene_end,
-                        max_dur=MAX_MAIN_SCENE_SEC)
+                        max_dur=MAX_MAIN_SCENE_SEC,
+                        track_index=mgr.SCENE_TRACK_INDEX)
 
-                    # NOVO: se habilitado, preenche o "buraco" com cenas aleatórias
+                    # NOVO: se habilitado, preenche o "buraco" com cenas aleatórias (V2)
                     if fill_gaps_with_random_scenes:
                         last_used = part.text
                         MIN_FILL_SEC = 3.0
@@ -528,12 +569,19 @@ def mount_sequence(
                         _fill_rejected_r2_dbg = 0
                         _fill_import_fail_dbg = 0
                         _fill_break_reason_dbg = "OK"
+                        # safety dinamico: dimensionado pelo tamanho do gap.
+                        # gap / MIN_FILL_SEC = limite teorico de cenas (cada
+                        # cena dura no minimo 3s); +20 de folga p/ rejeicoes
+                        # (REGRA1/REGRA2) sem travar. Minimo de 50 mantido
+                        # para gaps pequenos. Anti-loop real continua sendo
+                        # `current_scene_end <= prev_end + 1e-6`.
+                        SAFETY_MAX = max(50, int(_gap_alvo_dbg / MIN_FILL_SEC) + 20)
                         if _gap_alvo_dbg > 30.0:
                             print(f"[gap-debug] FILL inicio: part#{part_index:03d} "
                                   f"em t={current_scene_end.seconds:.1f}s, "
                                   f"alvo até t={next_scene_start.seconds:.1f}s "
-                                  f"(gap={_gap_alvo_dbg:.1f}s)")
-                        while current_scene_end.seconds < next_scene_start.seconds - 1e-6 and safety < 50:
+                                  f"(gap={_gap_alvo_dbg:.1f}s, safety_max={SAFETY_MAX})")
+                        while current_scene_end.seconds < next_scene_start.seconds - 1e-6 and safety < SAFETY_MAX:
                             # Não adiciona um clipe se o espaço restante for muito curto.
                             # Isso evita criar clipes "picotados" (ex.: 2s) quando sobra pouco tempo até a próxima cena.
                             remaining_gap = next_scene_start.seconds - current_scene_end.seconds
@@ -562,7 +610,7 @@ def mount_sequence(
                                 _fill_import_fail_dbg += 1
                                 if _gap_alvo_dbg > 30.0:
                                     print(f"[gap-debug]   import FALHOU '{random_file}' "
-                                          f"(safety={safety}/50)")
+                                          f"(safety={safety}/{SAFETY_MAX})")
                                 continue
 
                             prev_end = current_scene_end.seconds
@@ -571,7 +619,8 @@ def mount_sequence(
 
                             _insert_scene_clip(
                                 imported_rand, rand_path, current_scene_end,
-                                max_dur=max_fill_scene_duration)
+                                max_dur=max_fill_scene_duration,
+                                track_index=mgr.FILLER_SCENE_TRACK_INDEX)
 
                             # Se o Premiere não avançar o tempo, trava anti-loop
                             if current_scene_end.seconds <= prev_end + 1e-6:
@@ -592,7 +641,7 @@ def mount_sequence(
                                     _fill_rejected_r1_dbg += 1
                                     if _gap_alvo_dbg > 30.0 and _fill_rejected_r1_dbg <= 3:
                                         print(f"[gap-debug]   REGRA1 rejeitou '{random_file}' "
-                                              f"len={last_len_tmp:.2f}s<3s (safety={safety}/50)")
+                                              f"len={last_len_tmp:.2f}s<3s (safety={safety}/{SAFETY_MAX})")
                                     last_clip_tmp.remove(False, False)
                                     scenes_repetition_count = prev_rep
                                     del inserted_scene_dims[prev_dims_len:]
@@ -618,13 +667,13 @@ def mount_sequence(
                                         )
                                         mgr._PremiereManager__qe_razor_with_retry(
                                             track_type='video',
-                                            track_index=mgr.SCENE_TRACK_INDEX,
+                                            track_index=mgr.FILLER_SCENE_TRACK_INDEX,
                                             timecode=tc
                                         )
 
                                         # remove a parte da direita e atualiza referencia (1 leitura unica)
                                         vtrack_tmp = pymiere.objects.app.project.activeSequence.videoTracks[
-                                            mgr.SCENE_TRACK_INDEX]
+                                            mgr.FILLER_SCENE_TRACK_INDEX]
                                         n_tmp = len(vtrack_tmp.clips)
                                         if n_tmp > 0:
                                             vtrack_tmp.clips[n_tmp - 1].remove(False, False)
@@ -645,8 +694,8 @@ def mount_sequence(
                                         continue
 
                         # [gap-debug] resumo final do fill desta part
-                        if safety >= 50 and current_scene_end.seconds < next_scene_start.seconds - 1e-6:
-                            _fill_break_reason_dbg = "SAFETY=50 esgotado"
+                        if safety >= SAFETY_MAX and current_scene_end.seconds < next_scene_start.seconds - 1e-6:
+                            _fill_break_reason_dbg = f"SAFETY={SAFETY_MAX} esgotado"
                         _coberto = current_scene_end.seconds - _fill_start_dbg
                         _faltou = next_scene_start.seconds - current_scene_end.seconds
                         if _gap_alvo_dbg > 30.0 or _faltou > 1.0:
@@ -654,57 +703,70 @@ def mount_sequence(
                                   f"alvo={_gap_alvo_dbg:.1f}s coberto={_coberto:.1f}s "
                                   f"faltou={_faltou:.1f}s | inseridas={_fill_inserted_dbg} "
                                   f"R1={_fill_rejected_r1_dbg} R2={_fill_rejected_r2_dbg} "
-                                  f"impFail={_fill_import_fail_dbg} safety={safety}/50 | "
+                                  f"impFail={_fill_import_fail_dbg} safety={safety}/{SAFETY_MAX} | "
                                   f"motivo='{_fill_break_reason_dbg}'")
 
                 # Corte de cena excedente
-                # Modo rapido (duplicar/gaps habilitado):
-                #   VIDEO: nao corta - a proxima cena sobrescreve automaticamente (overwriteClip)
-                #          so corta na ultima cena para alinhar com fim da narracao
-                #   AUDIO: corta apenas se a cena TEM audio (overwrite nao afeta trilha de audio)
-                # Modo normal (ambos desabilitados):
-                #   Corta tudo (video + audio) como antes
-                _modo_rapido = duplicate_scenes_until_next or fill_gaps_with_random_scenes
+                # SEMPRE corta video + audio quando current_scene_end ultrapassa
+                # next_scene_start. A otimizacao antiga "skip_overwrite_V1" no
+                # modo rapido (deixar overwriteClip da proxima cena cuidar do
+                # corte automaticamente) causava bug visual quando a duracao
+                # da proxima cena fonte era menor ou igual ao overflow: o
+                # Premiere quebrava a cena anterior em pedacos estranhos e o
+                # `t.clips[n-1]` retornava um pedaco residual em vez da nova
+                # cena, deslocando todas as cenas seguintes (Bug 2 reportado
+                # em 2026-05-04). Custo do corte explicito eh ~1 razor extra
+                # por part com overflow - desprezivel diante da garantia.
                 is_last_part = (part_index + 1 >= len(narration_transcription_parts))
+                _last_track = last_inserted_track_idx
+                _force_cut_filler = (_last_track == mgr.FILLER_SCENE_TRACK_INDEX)
 
                 if current_scene_end.seconds > next_scene_start.seconds:
+                    _overflow = current_scene_end.seconds - next_scene_start.seconds
                     timecode_to_cut = pymiere.wrappers.timecode_from_time(
                         next_scene_start,
                         pymiere.objects.app.project.activeSequence
                     )
 
-                    # VIDEO: corta se modo normal OU se for a ultima cena
-                    if not _modo_rapido or is_last_part:
-                        mgr._PremiereManager__qe_razor_with_retry(
-                            track_type='video', track_index=mgr.SCENE_TRACK_INDEX, timecode=timecode_to_cut)
+                    # [scene-debug] sinaliza overflow e qual trilha foi cortada
+                    _cut_reason = ("ultima_part" if is_last_part
+                                    else ("filler_V2" if _force_cut_filler
+                                          else "coerente_V1"))
+                    print(f"[scene-debug]   OVERFLOW V{_last_track + 1} "
+                          f"em t={next_scene_start.seconds:.2f}s "
+                          f"(overflow={_overflow:.2f}s, corte={_cut_reason})")
 
-                        video_clips = pymiere.objects.app.project.activeSequence.videoTracks[
-                            mgr.SCENE_TRACK_INDEX].clips
-                        if len(video_clips) > 0:
-                            video_clips[-1].remove(False, False)
+                    # VIDEO: SEMPRE corta na trilha onde foi a ultima cena
+                    mgr._PremiereManager__qe_razor_with_retry(
+                        track_type='video', track_index=_last_track, timecode=timecode_to_cut)
 
-                        if inserted_scene_clips:
-                            try:
-                                vt_post = pymiere.objects.app.project.activeSequence.videoTracks[
-                                    mgr.SCENE_TRACK_INDEX]
-                                n_post = len(vt_post.clips)
-                                if n_post > 0:
-                                    inserted_scene_clips[-1] = vt_post.clips[n_post - 1]
-                            except Exception:
-                                pass
+                    video_clips = pymiere.objects.app.project.activeSequence.videoTracks[
+                        _last_track].clips
+                    if len(video_clips) > 0:
+                        video_clips[-1].remove(False, False)
 
-                    # AUDIO: corta apenas se a cena tem audio na trilha A0
+                    if inserted_scene_clips:
+                        try:
+                            vt_post = pymiere.objects.app.project.activeSequence.videoTracks[
+                                _last_track]
+                            n_post = len(vt_post.clips)
+                            if n_post > 0:
+                                inserted_scene_clips[-1] = vt_post.clips[n_post - 1]
+                        except Exception:
+                            pass
+
+                    # AUDIO: corta apenas se a cena tem audio na trilha correspondente
                     try:
                         audio_clips = pymiere.objects.app.project.activeSequence.audioTracks[
-                            mgr.SCENE_TRACK_INDEX].clips
+                            _last_track].clips
                         if len(audio_clips) > 0:
                             last_audio = audio_clips[-1]
                             # So corta se o audio realmente se estende alem do ponto
                             if last_audio.end.seconds > next_scene_start.seconds + 0.1:
                                 mgr._PremiereManager__qe_razor_with_retry(
-                                    track_type='audio', track_index=mgr.SCENE_TRACK_INDEX, timecode=timecode_to_cut)
+                                    track_type='audio', track_index=_last_track, timecode=timecode_to_cut)
                                 audio_clips = pymiere.objects.app.project.activeSequence.audioTracks[
-                                    mgr.SCENE_TRACK_INDEX].clips
+                                    _last_track].clips
                                 if len(audio_clips) > 0:
                                     last_a = audio_clips[-1]
                                     if abs(last_a.start.seconds - next_scene_start.seconds) < 0.15:
@@ -956,8 +1018,9 @@ def mount_sequence(
     # MIXER DE AUDIO (aplicar volumes em dB)
     # ==========================
     try:
-        print(f"[mixer] Aplicando volumes: cenas={vol_scene_db}dB, narracao={vol_narration_db}dB, cta={vol_cta_db}dB, musica={vol_music_db}dB")
-        mgr._PremiereManager__set_audio_track_volume_db(mgr.SCENE_TRACK_INDEX, vol_scene_db)
+        print(f"[mixer] Aplicando volumes: cenas={vol_scene_db}dB (A1+A2), narracao={vol_narration_db}dB, cta={vol_cta_db}dB, musica={vol_music_db}dB")
+        mgr._PremiereManager__set_audio_track_volume_db(mgr.SCENE_TRACK_INDEX, vol_scene_db)         # A1: cenas coerentes
+        mgr._PremiereManager__set_audio_track_volume_db(mgr.FILLER_SCENE_TRACK_INDEX, vol_scene_db)  # A2: cenas filler/dup
         mgr._PremiereManager__set_audio_track_volume_db(mgr.NARRATION_TRACK_INDEX, vol_narration_db)
         mgr._PremiereManager__set_audio_track_volume_db(mgr.CTA_AUDIO_TRACK_INDEX, vol_cta_db)
         mgr._PremiereManager__set_audio_track_volume_db(mgr.MUSIC_TRACK_INDEX, vol_music_db)
@@ -1060,7 +1123,7 @@ def _insert_cta(
 
     start_time = pymiere.wrappers.time_from_seconds(cta_time_s)
 
-    # Insere video na V3 (o Premiere automaticamente linka o audio na trilha correspondente)
+    # Insere video na V4 (o Premiere automaticamente linka o audio na trilha correspondente)
     mgr._PremiereManager__insert_clip_with_retry(
         track_type='video',
         track_index=mgr.CTA_TRACK_INDEX,
@@ -1105,6 +1168,30 @@ def mount_mass_project(
             for roteiro in roteiros:
                 roteiro_name = roteiro.get('name')
                 _open_or_create_sequence(roteiro_name)
+
+                # Garante que TODAS as trilhas necessarias existam ANTES de
+                # inserir conteudo. Sequencias novas do Premiere comecam com
+                # apenas 3 trilhas de video + 3 de audio, mas usamos ate V7/A8.
+                # Sem este bloco, inserir musica em A8 (idx 7) ou narracao em
+                # A3 numa sequencia recem-criada falha com IndexError.
+                _max_video_idx = max(
+                    mgr.SCENE_TRACK_INDEX, mgr.FILLER_SCENE_TRACK_INDEX,
+                    mgr.CTA_TRACK_INDEX, mgr.OVERLAY_TRACK_INDEX,
+                    mgr.LOGO_TRACK_INDEX, mgr.IMPACT_TEXT_TRACK_INDEX
+                )
+                _max_audio_idx = max(
+                    mgr.SCENE_TRACK_INDEX, mgr.FILLER_SCENE_TRACK_INDEX,
+                    mgr.NARRATION_TRACK_INDEX, mgr.CTA_AUDIO_TRACK_INDEX,
+                    mgr.MUSIC_TRACK_INDEX
+                )
+                try:
+                    mgr._PremiereManager__ensure_video_track_index(_max_video_idx)
+                except Exception:
+                    pass
+                try:
+                    mgr._PremiereManager__ensure_audio_track_index(_max_audio_idx)
+                except Exception:
+                    pass
 
                 # info.txt — uma linha por cena
                 info_lines = mgr._PremiereManager__read_info_lines_for_roteiro(

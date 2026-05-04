@@ -37,8 +37,9 @@ class SettingsManager:
                 'zoom_max': 110,
 
                 # cenas
-                'duplicate_scenes': True,
-                'fill_gaps_without_scene': False,
+                'duplicate_scenes': False,
+                'fill_gaps_without_scene': True,
+                'max_fill_scene_duration': 12.0,
 
                 # modo em massa
                 'mass_order': 'asc',

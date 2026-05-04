@@ -61,23 +61,28 @@ class PremiereManager():
     PREMIERE_MOVEMENT_EFFECT_NAME = 'Movimento'
     PREMIERE_SCALE_PROPERTY_NAME = 'Escala'
     # ── Trilhas de audio ──
-    # A0(idx 0) = audio da cena (mudo automatico)
-    # A1(idx 1) = narracao   A2(idx 2) = som CTA inscreva-se (linkado)
-    # A3(idx 3) = audio overlay (linkado)   A4(idx 4) = musica
+    # A1(idx 0) = audio cenas COERENTES (casadas com a fala)
+    # A2(idx 1) = audio cenas NAO-COERENTES (filler / duplicacoes)
+    # A3(idx 2) = narracao   A4(idx 3) = som CTA inscreva-se (linkado)
+    # A5..A7  reservadas (overlay com som / logo com som / texto sem audio)
+    # A8(idx 7) = musica
     SCENE_TRACK_INDEX = 0
-    NARRATION_TRACK_INDEX = 1
-    CTA_AUDIO_TRACK_INDEX = 2
-    MUSIC_TRACK_INDEX = 4
+    FILLER_SCENE_TRACK_INDEX = 1
+    NARRATION_TRACK_INDEX = 2
+    CTA_AUDIO_TRACK_INDEX = 3
+    MUSIC_TRACK_INDEX = 7
 
     FRAME_W = 1920
     FRAME_H = 1080
 
     # ── Trilhas de video ──
-    # V1(0)=Cenas  V2(1)=CTA  V3(2)=(livre)  V4(3)=Overlay  V5(4)=Logo  V6(5)=Frases impactantes
-    CTA_TRACK_INDEX = 2           # V3: Botao Inscreva-se
-    OVERLAY_TRACK_INDEX = 3       # V4: Overlay
-    LOGO_TRACK_INDEX = 4          # V5: Logo
-    IMPACT_TEXT_TRACK_INDEX = 5   # V6: Frases impactantes / legendas
+    # V1(0)=Cenas COERENTES  V2(1)=Cenas NAO-COERENTES (filler/dup)
+    # V3(2)=(vazio por design)  V4(3)=CTA  V5(4)=Overlay  V6(5)=Logo
+    # V7(6)=Frases impactantes
+    CTA_TRACK_INDEX = 3           # V4: Botao Inscreva-se
+    OVERLAY_TRACK_INDEX = 4       # V5: Overlay
+    LOGO_TRACK_INDEX = 5          # V6: Logo
+    IMPACT_TEXT_TRACK_INDEX = 6   # V7: Frases impactantes / legendas
     LOGO_MARGIN_PX = 30           # margem do logo nas bordas
     # LOGO_TARGET_HEIGHT_PX = 120   # altura padrão do logo (ajuste se quiser)
     LOGO_FIXED_SCALE_PERCENT = 12.0  # escala fixa do logo (Motion > Scale)
@@ -404,6 +409,10 @@ class PremiereManager():
             return True
         except Exception:
             # fallbacks QE (mantém sua ideia original)
+            # TODO(robustez V1/V2): hoje so e chamado de mount_mass_project
+            # (que insere todas as cenas em V1). Se for usado para clipes em
+            # V2 (FILLER) no futuro, este fallback pega o ultimo clip de V1
+            # (errado). Receber track_index como parametro quando ampliar.
             try:
                 qe_seq = pymiere.objects.qe.project.getActiveSequence()
                 qe_v = qe_seq.getVideoTrackAt(self.SCENE_TRACK_INDEX)
@@ -460,9 +469,9 @@ class PremiereManager():
         zoom_max_scale_multiplier,
         fade_percentage: float,
         apply_fade_immediately: bool = False,
-        duplicate_scenes_until_next: bool = True,
-        fill_gaps_with_random_scenes: bool = False,
-        max_fill_scene_duration: float = 0.0,
+        duplicate_scenes_until_next: bool = False,
+        fill_gaps_with_random_scenes: bool = True,
+        max_fill_scene_duration: float = 12.0,
 
         narrations_transcriptions: Optional[list[Any]] = None,
         impact_phrases_config: Optional[dict] = None,
@@ -1021,6 +1030,10 @@ class PremiereManager():
                     try:
                         qe_seq = pymiere.objects.qe.project.getActiveSequence()
                         # busca o clip no QE pela posicao
+                        # TODO(limpeza): atributo `_track_index` nao e setado em
+                        # nenhum lugar do codigo (verificado via grep). Sempre
+                        # cai no fallback 0 (V1). Codigo possivelmente legado;
+                        # avaliar se esta funcao ainda e usada antes de remover.
                         qe_track = qe_seq.getVideoTrackAt(
                             getattr(clip, '_track_index', 0) if hasattr(clip, '_track_index') else 0)
                         if qe_track:
@@ -1353,7 +1366,7 @@ class PremiereManager():
 
     def __insert_logo_full(self, *, logo_path: str, logo_position: str, seq_end_time, paths_map: dict, project_item_cache: dict, dims_cache: dict, roteiro_name: str = '', prerendered_logo_path: str = ''):
         """
-        Logo em V5 (LOGO_TRACK_INDEX):
+        Logo em V6 (LOGO_TRACK_INDEX):
         - Renderiza um video MP4 de 60s com o logo posicionado via FFmpeg.
         - Insere UMA VEZ e repete ate cobrir toda a sequencia.
         - logo_position: top_left, top_right, bottom_left, bottom_right
@@ -2261,7 +2274,7 @@ class PremiereManager():
 
         return None
 
-    # ====== CARTELA: garante trilha de vídeo V2 (para o texto) ======
+    # ====== Helpers genericos para garantir trilhas de video/audio ======
 
     def __ensure_audio_track_index(self, idx: int):
         """Garante que o indice de trilha de audio 'idx' exista."""
@@ -2477,7 +2490,10 @@ class PremiereManager():
 
     def apply_fade_to_scene_track_clips(self, fade_percentage: float = 10.0) -> int:
         """
-        Aplica fade-in/out (opacidade) em TODOS os clipes da trilha de cenas (V0).
+        Aplica fade-in/out (opacidade) em TODOS os clipes da trilha V1/A1
+        (cenas COERENTES). NAO cobre V2/A2 (cenas filler/duplicadas).
+        Atualmente nao chamada pelo programa - se voltar a ser usada para
+        clipes filler, precisa ampliar para FILLER_SCENE_TRACK_INDEX tambem.
         fade_percentage: porcentagem da duração do clipe (ex.: 10%).
         Retorna quantos clipes receberam o efeito.
         """
@@ -2517,7 +2533,7 @@ class PremiereManager():
         cena_index: Optional[int] = None
     ) -> float:
         """
-        Gera um MP4 (fundo preto + texto centralizado) via FFmpeg e insere como um único clipe em V0.
+        Gera um MP4 (fundo preto + texto centralizado) via FFmpeg e insere como um único clipe em V1.
         Aplica zoom coerente e fade-out no final. Retorna a duração aplicada.
         O estilo é lido de partes/<roteiro_name>/estilodetexto.prtextstyle (se existir).
         """

@@ -1,5 +1,6 @@
 import tkinter as tk
 import sys
+import threading
 
 
 class WorkingScreen:
@@ -25,7 +26,12 @@ class WorkingScreen:
 
 
 class TerminalPopup:
-    """Terminal persistente em popup. Captura stdout/stderr sempre."""
+    """Terminal persistente em popup. Captura stdout/stderr sempre.
+
+    Thread-safe: prints vindos de threads worker (Premiere/FFmpeg/Impact)
+    sao agendados na main thread via app.after(0, ...) porque Tkinter NAO
+    suporta atualizacao de widgets fora da main thread.
+    """
 
     def __init__(self, app: tk.Tk):
         self.app = app
@@ -33,6 +39,9 @@ class TerminalPopup:
         self._text = None
         self._original_stdout = sys.stdout
         self._original_stderr = sys.stderr
+        self._buffer = ''
+        self._main_thread_id = threading.get_ident()
+        self._closed = False
 
         # Redireciona stdout/stderr permanentemente
         sys.stdout = _TerminalWriter(self._write, self._original_stdout)
@@ -88,6 +97,7 @@ class TerminalPopup:
 
     def close(self):
         """Restaura stdout/stderr e destroi a janela. Usado no shutdown do app."""
+        self._closed = True
         try:
             sys.stdout = self._original_stdout
             sys.stderr = self._original_stderr
@@ -109,21 +119,47 @@ class TerminalPopup:
         self._buffer = ''
 
     def _write(self, text: str):
-        # Acumula em buffer (para quando a janela nao existe ainda)
-        if not hasattr(self, '_buffer'):
-            self._buffer = ''
+        """Recebe texto do _TerminalWriter (de qualquer thread).
+
+        Acumula no buffer (sempre seguro) e agenda a insercao no widget
+        na main thread. Tkinter NAO eh thread-safe; chamar text.insert
+        de uma thread worker falha silenciosamente, e era a causa raiz
+        de logs aparecerem no CMD mas nao no terminal GUI.
+        """
+        if self._closed:
+            return
+        # Buffer eh sempre acumulado (lido pela main thread quando a janela
+        # for criada). Concatenacao de string eh thread-safe em CPython
+        # (GIL), entao nao precisa de lock aqui.
         self._buffer += text
 
-        # Escreve no widget se existir
-        if self._text and self._window and self._window.winfo_exists():
-            try:
-                self._text.configure(state='normal')
-                self._text.insert('end', text)
-                self._text.see('end')
-                self._text.configure(state='disabled')
-                self.app.update_idletasks()
-            except Exception:
-                pass
+        # Se ja estamos na main thread, escreve direto (mais rapido).
+        if threading.get_ident() == self._main_thread_id:
+            self._write_to_widget(text)
+            return
+
+        # Caso contrario, agenda na main thread via app.after(0, ...).
+        try:
+            self.app.after(0, lambda t=text: self._write_to_widget(t))
+        except Exception:
+            # app pode estar sendo destruido — ignora silenciosamente
+            pass
+
+    def _write_to_widget(self, text: str):
+        """Insere texto no widget Text. SEMPRE roda na main thread."""
+        if self._closed:
+            return
+        if not self._text or not self._window:
+            return
+        try:
+            if not self._window.winfo_exists():
+                return
+            self._text.configure(state='normal')
+            self._text.insert('end', text)
+            self._text.see('end')
+            self._text.configure(state='disabled')
+        except Exception:
+            pass
 
 
 class _TerminalWriter:
