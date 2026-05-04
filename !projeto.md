@@ -3,8 +3,8 @@
 > **Propósito:** índice rápido para localizar código sem precisar varrer o repo.
 > Leia o arquivo correspondente à sua tarefa em vez de tudo.
 > **Manutenção:** atualize quando mudar estrutura, fluxo crítico ou convenção. Não documente todas as features — só o que ajuda a IA a navegar.
-> Última atualização: 2026-04-15
-> Versão atual: constantes `VERSAO` e `VERSAO_APLICACAO` em `app/__version__.py` (fonte única). São reescritas pela etapa **[1.5/6]** do `build_e_deploy.bat`, lendo de `versao.json` (manual `!deploy.md`).
+> Última atualização: 2026-05-04
+> Versão atual: constantes `VERSAO` e `VERSAO_APLICACAO` em `app/__version__.py` (fonte única, `__version__.py` = 2.7 publicada / `versao.json` = 2.8 em desenvolvimento). São reescritas pela etapa **[1.5/6]** do `build_e_deploy.bat`, lendo de `versao.json` (manual `!deploy.md`).
 
 ---
 
@@ -70,6 +70,7 @@ editor-premiere-premium/
 ├── AGENTS.md                         # Notas de agentes (similar a CLAUDE.md, contexto multi-agente)
 ├── CLAUDE.md                         # Instruções para IA
 ├── temporary_rules.md                # Regras temporárias do projeto
+├── reminder.md                       # Lembretes ativos do usuário (lidos pelas IAs no início da sessão)
 ├── !projeto.md                       # Este mapa
 ├── !executar.md                      # Plano de execução / fila de tarefas
 │
@@ -296,16 +297,16 @@ Há **dois updaters**:
 | `app/managers/DirectoriesManager.py` | Para entender estrutura de pastas | Garante pastas (cenas, narração, música, etc.), lista opções, modo em massa |
 | `app/managers/ConversionManager.py` | Para entender fallback de importação | Converte audio→mp3, imagem→png, video→mp4, identifica tipo por extensão |
 | `app/managers/TranscriptionManager.py` | Para entender transcrição | AssemblyAI com `speech_models=['universal-3-pro', 'universal-2']`, timeout 300s, retry para erros transitórios, validação via `ffprobe` + log antes do upload, cache JSON + casamento cena-fala via OpenAI (gpt-4o-mini). Em recusa da AssemblyAI, **não** normaliza nem reenviar — propaga o erro real via `_AssemblyRefusedError`. Keys via `@property` que chama `get_api_key()` |
-| `app/managers/TextOnScreenManager.py` | Para entender frases impactantes | Seleção GPT + render FFmpeg (.mov alpha) + inserção em V6. `OPENAI_API_KEY` via `@property`/`get_api_key()` |
+| `app/managers/TextOnScreenManager.py` | Para entender frases impactantes | Seleção GPT + render FFmpeg (.mov alpha) + inserção em V7 (track_index=6). `OPENAI_API_KEY` via `@property`/`get_api_key()` |
 | `app/managers/SceneRenamerManager.py` | Para entender o renomeador | Gemini descrição + embeddings + SciPy matching + cache em cache/ |
 | `app/managers/PremiereManager.py` | Para entender integração Premiere | Núcleo: status, importar, sequência, timeline, zoom, fade, música, overlay, logo |
 | `app/managers/premiere/core.py` | Para entender conexão Premiere | Retries, backoff, heartbeat, reset, fast_ops |
 | `app/managers/premiere/media.py` | Para entender importação | Importação de arquivos com fallback |
-| `app/managers/premiere/editing.py` | Para entender montagem | Timeline, zoom, fade, música, overlay, logo |
+| `app/managers/premiere/editing.py` | Para entender montagem | Timeline, zoom, fade, música, overlay, logo. **Roteamento V1/V2:** cena coerente casada com `part` (OpenAI) -> V1; cenas filler/duplicadas -> V2. `_insert_scene_clip(track_index=...)` parametrizado; `last_inserted_track_idx` (`nonlocal`) lembra a track da ultima insercao para o bloco "Corte de cena excedente" usar. Corte SEMPRE acontece quando `current_scene_end > next_scene_start` (incondicional desde 2026-05-04 - ver Bug 2 na sec.12). Logs de diagnostico: `[scene-debug]` (alvo/real/DELTA por part + OVERFLOW) e `[gap-debug]` (resumo do fill com safety dinamico = `max(50, gap/3 + 20)`). |
 | `app/ui/screens/InitialScreen.py` | Para entender tela inicial | Mensagem de status, botão Prosseguir, auto-check. **Menubar próprio** (Opcoes > Credenciais / Instalar pymiere; Ajuda; Sair) — `on_open_settings` e `on_logout` são wirados em `index.py` (mesmas funções usadas pela MainScreen). Aplicado em `render()` via `app.config(menu=...)`. |
 | `app/ui/screens/MainScreen.py` | Para entender tela principal | Todas as opções de configuração, mixer de áudio, menu com "Sair (deslogar)", botão Renomear Cenas. **Menubar próprio** aplicado em `render()` (não em `__init__`) — cada tela (Initial/Main) instala seu menubar em `app.config(menu=...)` quando renderiza. |
 | `app/ui/screens/SettingsScreen.py` | Para entender tela de credenciais | **Tela de status** dos 3 slugs (OpenAI/AssemblyAI/Gemini). Refresh async, modo `force_block` que bloqueia saída, botão "Sair (deslogar)". Sem campos de edição. |
-| `app/ui/screens/WorkingScreen.py` | Para entender tela de processamento | Barra de progresso, TerminalPopup (captura stdout/stderr) |
+| `app/ui/screens/WorkingScreen.py` | Para entender tela de processamento | Barra de progresso, TerminalPopup (captura stdout/stderr). **Thread-safe** desde 2026-05-04: `_write` detecta thread (`threading.get_ident()`) e agenda escrita no widget via `app.after(0, ...)` quando vem de thread worker (Tkinter nao eh thread-safe; sem isso, prints de threads worker falhavam silenciosamente no widget e so apareciam no CMD original). |
 | `app/ui/screens/RenamerFeedbackScreen.py` | Para entender o renomeador UI | Fase 1 (setup + processamento) e Fase 2 (revisão split-screen com thumbnails/hover-play) |
 | `app/ui/dialogs/StyleEditorDialog.py` | Para entender editor de estilos | Cor, borda, sombra, animação, preview em tempo real, salvar/carregar estilos |
 | `app/ui/components/select.py` | Para entender componentes | Componente de seleção reutilizável |
@@ -332,6 +333,11 @@ Há **dois updaters**:
 | `exemplo-cenas-com-feedback.py` | Exemplo de uso | Demo do renomeador com feedback |
 | `proxima-execucao.md` | Notas livres | Anotações curtas para a próxima execução |
 | `AGENTS.md` / `README.md` | Contexto de repo | Apresentação e notas para agentes/contribuintes |
+| `CLAUDE.md` | Para entender instrucoes de IA | Aponta para `D:/regra-global-LLM/RULES.md` (regras globais) e `temporary_rules.md` (regras locais) |
+| `temporary_rules.md` | Para entender regras locais | Regras especificas deste projeto (ex.: notas de versao duplicam o numero antes de bumpar; pastas geradas a ignorar). Diferente de `RULES.md` que e global. |
+| `reminder.md` | Sempre ler ao iniciar sessao | Lembretes ativos do usuario. Atualmente vazio. |
+| `!projeto.md` | Este arquivo | Mapa do projeto (este documento). |
+| `!executar.md` | Para coordenacao com Codex/Antigravity | Fila de tarefas pendentes/concluidas, dividida por Claude 1 e Claude 2. Codex/Antigravity escrevem aqui; Claude executa. |
 
 ---
 
@@ -423,26 +429,61 @@ Contém **apenas** `ui_cache` e `renamer_ui`. API keys não são mais persistida
 ### Referência de build:
 Consultar `D:/regra-global-LLM/implementacoes/!deploy.md` para o template de `build_e_deploy.bat`. Esse manual contém o passo-a-passo completo para criar o .bat, incluindo build PyInstaller, zipagem, upload FTP e bump de versão.
 
-### Faixas no Premiere (mapeamento):
+### Faixas no Premiere (mapeamento — atualizado em 2026-05-03)
 
-**Vídeo:**
+**Constantes em `PremiereManager.py` (fonte unica):**
+- `SCENE_TRACK_INDEX = 0`
+- `FILLER_SCENE_TRACK_INDEX = 1` (NOVO)
+- `NARRATION_TRACK_INDEX = 2`
+- `CTA_AUDIO_TRACK_INDEX = 3`
+- `MUSIC_TRACK_INDEX = 7`
+- `CTA_TRACK_INDEX = 3`
+- `OVERLAY_TRACK_INDEX = 4`
+- `LOGO_TRACK_INDEX = 5`
+- `IMPACT_TEXT_TRACK_INDEX = 6`
+
+**Vídeo (7 trilhas):**
 | Faixa | Index | Conteúdo |
 |---|---|---|
-| V1 | 0 | Cenas |
-| V3 | 2 | CTA Inscreva-se |
-| V4 | 3 | Overlay |
-| V5 | 4 | Logo |
-| V6 | 5 | Frases impactantes (legendas) |
+| V1 | 0 | Cenas COERENTES (casadas com a fala pela OpenAI) |
+| V2 | 1 | Cenas NÃO-COERENTES (filler aleatorio + duplicacoes) |
+| V3 | 2 | (vazio por design — separa V1/V2 dos recursos visuais) |
+| V4 | 3 | CTA "Inscreva-se" |
+| V5 | 4 | Overlay |
+| V6 | 5 | Logo |
+| V7 | 6 | Frases impactantes (legendas) |
 
-**Áudio:**
+**Áudio (8 trilhas):**
 | Faixa | Index | Conteúdo |
 |---|---|---|
-| A1 | 0 | Áudio das cenas |
-| A2 | 1 | Narração |
-| A3 | 2 | Inscreva-se (CTA) |
-| A5 | 4 | Música |
+| A1 | 0 | Áudio das cenas COERENTES |
+| A2 | 1 | Áudio das cenas NÃO-COERENTES (filler/dup) |
+| A3 | 2 | Narração |
+| A4 | 3 | Áudio do CTA (linkado ao V4) |
+| A5 | 4 | (reservada — overlay com som, atualmente nao usada) |
+| A6 | 5 | (reservada — logo com som, atualmente nao usada) |
+| A7 | 6 | (vazia — texto nao tem audio) |
+| A8 | 7 | Música |
+
+**Mixer da MainScreen** (label entre parenteses indica trilhas-alvo):
+- "Cenas (A1+A2)" -> aplica `vol_scene_db` em A1 **e** A2 simultaneamente (cenas coerentes + filler ficam mudas/iguais).
+- "Narracao (A3)" -> A3.
+- "Inscreva-se (A4)" -> A4.
+- "Musica (A8)" -> A8.
 
 Volume: dB convertido para ganho linear via `10^((dB - 15) / 20)`.
+
+**Roteamento de cenas em `mount_sequence`:**
+- `duplicate_scenes_until_next=True`: 1ª iteracao casada vai em V1, repeticoes em V2.
+- `else + fill_gaps_with_random_scenes=True`: cena coerente unica em V1; cenas aleatorias do fill em V2.
+- Modo em massa (`mount_mass_project`): NAO distingue coerente/filler — todas as cenas vao em V1/A1 (modo nao tem casamento OpenAI).
+
+**Defaults atuais** (depois do redesign de 2026-05-03):
+- `duplicate_scenes_until_next = False`
+- `fill_gaps_with_random_scenes = True`
+- `max_fill_scene_duration = 12.0`s
+
+**Garantia de trilhas:** ambos `mount_sequence` e `mount_mass_project` chamam `__ensure_video_track_index(_max)`/`__ensure_audio_track_index(_max)` antes de inserir conteudo. Sequencias novas do Premiere comecam com so 3 trilhas; sem este bloco, inserir em V7/A8 falharia com IndexError.
 
 ---
 
@@ -467,7 +508,7 @@ Adicionado sistema de autenticação, atualização automática e credenciais re
 - **Pasta `core/`:** três novos módulos (`auth.py`, `updater.py`, `remote_credentials.py`)
 - **`index.py` refatorado:** fluxo linear Login → Update → Credenciais → Tela inicial
 
-### v2.4 (atual compilada)
+### v2.4
 Endurecimento da transcrição AssemblyAI, melhorias de update e UI:
 - **Renomeador de cenas:** seleção direta de vídeos (filtra extensões compatíveis com IA), defaults mais práticos.
 - **Auto-update:** log detalhado passo a passo, janela permanece aberta em erro com botão "Fechar", arquivo de log salvo automaticamente, fim do loop de baixar atualização já instalada, encerramento garantido do app antigo antes de copiar.
@@ -480,8 +521,21 @@ Endurecimento da transcrição AssemblyAI, melhorias de update e UI:
   - Em recusa (`TranscriptError`/`failed to transcribe url`/`select-the-speech-model`): embrulha o erro original em `_AssemblyRefusedError` e propaga (sem fallback de normalização).
   - Mensagens de erro distintas para configuração de `speech_models`, recusa final (lista nomes dos arquivos), `ValueError` de arquivo inválido e timeout. Sem `handle_thread_error` para falhas conhecidas.
 
-### v2.5 (em desenvolvimento)
-Próxima versão (conforme `versao.json`). Sem mudanças mapeadas aqui ainda.
+### v2.5 e v2.6 (publicadas)
+Versões publicadas com correções menores e ajustes de UX (conforme `release_notes.txt`/`versoes_publicadas.txt`). Sem mudanças estruturais mapeadas aqui.
+
+### v2.7 (publicada em 2026-05-04)
+Reorganização das trilhas de vídeo/áudio + correção de bugs em fill_gaps:
+
+- **Separação V1/V2 de cenas** (cenas coerentes em V1, filler/duplicadas em V2). Permite ao usuário identificar visualmente na timeline a proporção e localização de cada categoria. Forçou remapeamento de quase todas as constantes de track (CTA: V3→V4, Overlay: V4→V5, Logo: V5→V6, Frases: V6→V7; Narração: A2→A3, CTA audio: A3→A4, Música: A5→A8).
+- **Defaults novos** mais práticos: `duplicate_scenes=False`, `fill_gaps=True`, `max_fill=12.0s` (antes: `True/False/0.0`).
+- **Mixer "Cenas"** agora aplica `vol_scene_db` em **A1+A2** simultaneamente. Labels da MainScreen atualizadas.
+- **Bug 1 (gaps vazios) corrigido:** `safety` do loop de fill_gaps virou dinâmico — `max(50, int(gap/3) + 20)` por part. Antes travava em 50 e deixava gaps de 1500+s parcialmente vazios em narrações longas.
+- **Bug 2 (cenas em V1 fora de sync) corrigido:** removida otimização `skip_overwrite_V1` no bloco "Corte de cena excedente". Agora SEMPRE corta V1/V2 quando há overflow. Causa raiz: quando overflow ≥ duração da próxima cena fonte, o `overwriteClip` quebrava o clipe anterior em pedaços estranhos e `t.clips[n-1]` retornava o pedaço errado, deslocando todas as cenas seguintes.
+- **TerminalPopup thread-safe:** prints de threads worker (Premiere/FFmpeg/Impact) agora aparecem corretamente no terminal GUI via `app.after(0, ...)`. Antes vazavam só pro CMD original (Tkinter não é thread-safe).
+- **Logs de diagnóstico:** `[scene-debug]` rastreia cada part (alvo/real/DELTA/OVERFLOW); `[gap-debug]` resume cada loop de fill com safety dinâmico.
+- **`mount_mass_project` defensivo:** ganhou bloco `__ensure_*_track_index(_max)` no início de cada roteiro (antes podia falhar com IndexError ao inserir música em A8 numa sequência nova).
+- **Auto-update e instalação Pymiere:** `app/utils/pymiere_installer.py` finaliza fluxo de bootstrap completo (Python embeddable + pip install pymiere + cópia de painéis CEP + PlayerDebugMode no registry).
 
 ---
 
@@ -538,6 +592,21 @@ Próxima versão (conforme `versao.json`). Sem mudanças mapeadas aqui ainda.
 ### Threading
 - Quase todas as operações pesadas rodam em threads daemon. Se o app fechar durante processamento, threads são interrompidas abruptamente.
 - O `TerminalPopup` captura stdout/stderr desde o início — pode acumular muito texto em sessões longas.
+- **Tkinter NAO eh thread-safe.** Qualquer escrita em widget (`text.insert`, `label.config`, etc.) feita de uma thread worker falha silenciosamente. O `TerminalPopup._write` resolve isso agendando via `app.after(0, ...)` na main thread (desde 2026-05-04). Se for criar UI nova que precise ser atualizada de threads, seguir o mesmo padrao.
 
 ### Paths
 - O `ffmpeg_path.py` é chamado no topo de `index.py` (antes de qualquer import de moviepy) para setar `IMAGEIO_FFMPEG_EXE`. Se esse import falhar, moviepy usa o ffmpeg do sistema (se houver).
+
+### Trilhas V1/V2 e mixer
+- **Mixer "Cenas" aplica em A1 e A2 simultaneamente.** Se mexer no codigo do MIXER em `editing.py`, lembrar de cobrir as duas trilhas — esquecer A2 deixa cenas filler audiveis enquanto coerentes ficam mudas (ou vice-versa).
+- **`SCENE_TRACK_INDEX` esta em varios lugares hardcoded** que NAO se aplicam a V2: `apply_fade_to_scene_track_clips` (so V1), `__set_speed_with_retry` (fallback QE so V1), `__insert_title_card` (cartela em V1, modo massa). Se ampliar essas funcoes para V2, parametrizar `track_index` como em `_insert_scene_clip`.
+- **Atributo `_track_index` em clip eh legado.** Em `PremiereManager.py:1025` (Ultra Key fallback), o `getattr(clip, '_track_index', 0)` sempre cai no fallback 0 porque o atributo nao eh setado em lugar nenhum. Codigo possivelmente legado/incompleto.
+
+### Corte de cena excedente
+- **NUNCA voltar a otimizacao "skip_overwrite_V1"** (deixar overwriteClip da proxima cena cortar V1 automaticamente). Bug 2 reportado em 2026-05-03: quando `overflow ≥ duração da próxima cena fonte`, o Premiere quebra o clip anterior em pedaços estranhos e o `t.clips[n-1]` em `__insert_clip_with_retry` retorna pedaço residual em vez da nova cena, deslocando todas as cenas seguintes. Solucao: corte explicito SEMPRE quando ha overflow (custo: ~1 razor extra por part — desprezivel).
+- O `last_inserted_track_idx` (`nonlocal` em `_insert_scene_clip`) eh a fonte de verdade pra saber em qual track cortar (V1 ou V2). Nao recalcular nem assumir.
+
+### Fill gaps
+- **`safety` do loop de fill_gaps eh dinamico:** `max(50, int(gap/3) + 20)`. NAO trocar por valor fixo — narracoes longas (>10 min de gap) precisam de centenas de fillers. A trava real anti-loop continua sendo `current_scene_end <= prev_end + 1e-6`.
+- REGRA 1 (rejeita filler < 3s) e REGRA 2 (anti-restinho) operam em V2 (FILLER_SCENE_TRACK_INDEX). Se mudar a logica, manter o `track_index` consistente.
+- Logs `[scene-debug]` e `[gap-debug]` sao a forma correta de diagnosticar bugs de timeline. NAO remover sem justificativa.
