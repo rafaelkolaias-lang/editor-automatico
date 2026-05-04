@@ -6,5 +6,5 @@
 # Manter no formato exato (sem indentacao, aspas duplas, em
 # linhas separadas) para o regex do .bat funcionar.
 # ============================================================
-VERSAO = "2.6"
-VERSAO_APLICACAO = "v2.6"
+VERSAO = "2.7"
+VERSAO_APLICACAO = "v2.7"
